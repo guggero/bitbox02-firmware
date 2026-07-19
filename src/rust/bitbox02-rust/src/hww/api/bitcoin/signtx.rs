@@ -504,7 +504,11 @@ async fn validate_input_script_configs<'a>(
     // multisig/policy confirmation in that flow would be misleading; reuse the same
     // "Sign message" header that process_bip322 puts on the address and message screens so
     // the whole BIP-322 confirmation sequence reads consistently.
-    let confirm_title = if is_bip322 { "Sign message" } else { "Spend from" };
+    let confirm_title = if is_bip322 {
+        "Sign message"
+    } else {
+        "Spend from"
+    };
 
     // If there are multiple script configs, only SimpleType (single sig, no additional inputs)
     // configs are allowed, so e.g. mixing p2wpkh and pw2wpkh-p2sh is okay, but mixing p2wpkh with
@@ -870,7 +874,7 @@ async fn process_bip322(
             request.locktime,
             tx_input.sequence,
             bip322::SighashMode::Taproot,
-        );
+        )?;
         let spend_info = get_taproot_spend_info(
             hal,
             &mut xpub_cache,
@@ -881,8 +885,13 @@ async fn process_bip322(
         next_response.next.signature =
             sign_taproot_input(hal, &tx_input.keypath, &sighash, &spend_info).await?;
     } else {
-        let script_code =
-            sighash_script(hal, &mut xpub_cache, script_config_account, &tx_input.keypath).await?;
+        let script_code = sighash_script(
+            hal,
+            &mut xpub_cache,
+            script_config_account,
+            &tx_input.keypath,
+        )
+        .await?;
         let sighash = bip322::sighash(
             message,
             &script_pubkey,
@@ -892,7 +901,7 @@ async fn process_bip322(
             bip322::SighashMode::SegwitV0 {
                 script_code: &script_code,
             },
-        );
+        )?;
 
         // sign_ecdsa_input may engage the anti-klepto exchange which resets next_response.next
         // via get_request. We therefore set has_signature only AFTER it returns.
@@ -984,8 +993,7 @@ async fn _process(
         return Err(Error::InvalidInput);
     }
     let validated_script_configs =
-        validate_input_script_configs(hal, coin_params, &request.script_configs, is_bip322)
-            .await?;
+        validate_input_script_configs(hal, coin_params, &request.script_configs, is_bip322).await?;
     let validated_output_script_configs =
         validate_script_configs(hal, coin_params, &request.output_script_configs).await?;
 
