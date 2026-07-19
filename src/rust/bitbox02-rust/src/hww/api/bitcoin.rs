@@ -6,6 +6,8 @@ compile_error!("Bitcoin code is being compiled even though the app-bitcoin featu
 
 mod bip143;
 mod bip322;
+#[cfg(test)]
+mod bip322_spec_vectors;
 mod bip341;
 pub mod common;
 pub mod keypath;
