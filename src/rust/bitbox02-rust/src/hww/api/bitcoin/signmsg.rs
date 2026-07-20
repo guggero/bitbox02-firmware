@@ -43,15 +43,14 @@ async fn sign_bip322_p2tr(
             .pk_script(coin_params)?;
 
     // Simple format: version=0, locktime=0, sequence=0.
-    let sighash = bip322::sighash(msg, &script_pubkey, 0, 0, 0, bip322::SighashMode::Taproot);
+    let sighash = bip322::sighash(msg, &script_pubkey, 0, 0, 0, bip322::SighashMode::Taproot)?;
 
     // BIP-86 key-path spend: tweak private key by hash of public key (no merkle root).
     let xpub = xpub_cache.get_xpub(hal, keypath).await?;
     let pubkey = bitcoin::PublicKey::from_slice(xpub.public_key()).map_err(|_| Error::Generic)?;
     let tweak = bitcoin::TapTweakHash::from_key_and_tweak(pubkey.into(), None);
 
-    let sig =
-        keystore::secp256k1_schnorr_sign(hal, keypath, &sighash, Some(tweak.as_byte_array()))
+    let sig = keystore::secp256k1_schnorr_sign(hal, keypath, &sighash, Some(tweak.as_byte_array()))
         .await?;
 
     Ok(bip322::encode_simple_witness(&sig))
