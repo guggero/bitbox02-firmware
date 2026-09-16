@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
+pub mod musig;
+
 use super::Error;
 use super::params::Params;
 use super::pb;
 use crate::hal::ui::ConfirmParams;
+use musig::Placeholder;
 use pb::BtcCoin;
 
 use pb::btc_script_config::Policy;
@@ -140,28 +143,29 @@ fn get_change_and_address_index<R: core::convert::AsRef<str>, T: core::iter::Ite
     keypath: &[u32],
 ) -> Result<(bool, u32), Error> {
     for pk in pubkeys {
-        let (key_index, multipath_index_left, multipath_index_right) =
-            parse_wallet_policy_pk(pk.as_ref()).or(Err(Error::InvalidInput))?;
-
-        match keys.get(key_index) {
-            Some(pb::KeyOriginInfo {
-                keypath: keypath_account,
-                ..
-            }) if is_our_key[key_index]
-                && keypath.starts_with(keypath_account)
-                && keypath.len() == keypath_account.len() + 2 =>
-            {
-                let keypath_change = keypath[keypath.len() - 2];
-                let is_change = if keypath_change == multipath_index_left {
-                    false
-                } else if keypath_change == multipath_index_right {
-                    true
-                } else {
-                    continue;
-                };
-                return Ok((is_change, keypath[keypath.len() - 1]));
+        let placeholder = Placeholder::parse(pk.as_ref())?;
+        let (multipath_index_left, multipath_index_right) = (placeholder.left, placeholder.right);
+        for key_index in placeholder.indexes {
+            match keys.get(key_index) {
+                Some(pb::KeyOriginInfo {
+                    keypath: keypath_account,
+                    ..
+                }) if is_our_key[key_index]
+                    && keypath.starts_with(keypath_account)
+                    && keypath.len() == keypath_account.len() + 2 =>
+                {
+                    let keypath_change = keypath[keypath.len() - 2];
+                    let is_change = if keypath_change == multipath_index_left {
+                        false
+                    } else if keypath_change == multipath_index_right {
+                        true
+                    } else {
+                        continue;
+                    };
+                    return Ok((is_change, keypath[keypath.len() - 1]));
+                }
+                _ => continue,
             }
-            _ => continue,
         }
     }
     Err(Error::InvalidInput)
@@ -178,6 +182,12 @@ impl miniscript::Translator<String> for WalletPolicyPkTranslator<'_> {
     type Error = Error;
 
     fn pk(&mut self, pk: &String) -> Result<bitcoin::PublicKey, Error> {
+        let placeholder = Placeholder::parse(pk)?;
+        if placeholder.musig {
+            let (aggregate, _, _) =
+                placeholder.derive(self.keys, self.is_change, self.address_index)?;
+            return Ok(bitcoin::PublicKey::new(aggregate.public_key()));
+        }
         let (key_index, multipath_index_left, multipath_index_right) =
             parse_wallet_policy_pk(pk).or(Err(Error::InvalidInput))?;
 
@@ -357,24 +367,27 @@ impl ParsedPolicy<'_> {
     fn validate_keys(&self) -> Result<(), Error> {
         // in "@key_index/<left;right>", keeps track of (key_index,left) and
         // (key_index,right) to check for duplicates.
-        let mut derivations_seen: Vec<(usize, u32)> = Vec::new();
+        let mut derivations_seen: Vec<(Vec<usize>, u32)> = Vec::new();
 
         let mut keys_seen: Vec<bool> = vec![false; self.policy.keys.len()];
 
         for pk in self.iter_pk() {
-            let (key_index, multipath_index_left, multipath_index_right) =
-                parse_wallet_policy_pk(pk.as_ref()).or(Err(Error::InvalidInput))?;
-
-            if derivations_seen.contains(&(key_index, multipath_index_left)) {
+            let mut placeholder = Placeholder::parse(&pk)?;
+            if placeholder.musig && !matches!(self.descriptor, Descriptor::Tr(_)) {
                 return Err(Error::InvalidInput);
             }
-            derivations_seen.push((key_index, multipath_index_left));
-            if derivations_seen.contains(&(key_index, multipath_index_right)) {
-                return Err(Error::InvalidInput);
+            // BIP388 treats aggregates with the same participant set as the same placeholder.
+            placeholder.indexes.sort_unstable();
+            for branch in [placeholder.left, placeholder.right] {
+                let derivation = (placeholder.indexes.clone(), branch);
+                if derivations_seen.contains(&derivation) {
+                    return Err(Error::InvalidInput);
+                }
+                derivations_seen.push(derivation);
             }
-            derivations_seen.push((key_index, multipath_index_right));
-
-            *keys_seen.get_mut(key_index).ok_or(Error::InvalidInput)? = true;
+            for index in placeholder.indexes {
+                *keys_seen.get_mut(index).ok_or(Error::InvalidInput)? = true;
+            }
         }
 
         if !keys_seen.into_iter().all(|b| b) {
@@ -656,6 +669,9 @@ impl ParsedPolicy<'_> {
     fn taproot_is_unspendable_internal_key(&self) -> Result<Option<usize>, Error> {
         match &self.descriptor {
             Descriptor::Tr(tr) => {
+                if tr.iter_pk().any(|pk| pk.starts_with("musig(")) {
+                    return Ok(None);
+                }
                 let (internal_key_index, _, _) = parse_wallet_policy_pk(tr.inner.internal_key())
                     .map_err(|_| Error::InvalidInput)?;
                 let internal_xpub = self
@@ -764,8 +780,9 @@ pub async fn parse<'a>(
         // Match tr(...).
         [b't', b'r', b'(', .., b')'] => {
             // Taproot parsing does not apply all Miniscript sanity checks. Validate every leaf
-            // and check the descriptor explicitly.
-            let tr = miniscript::descriptor::Tr::from_str(desc).map_err(|_| Error::InvalidInput)?;
+            // and check the descriptor explicitly. MuSig2 key expressions are substituted by
+            // their aggregate keys first, see musig::parse_tr().
+            let tr = musig::parse_tr(desc)?;
             for leaf in tr.leaves() {
                 validate_miniscript(leaf.miniscript())?;
             }
