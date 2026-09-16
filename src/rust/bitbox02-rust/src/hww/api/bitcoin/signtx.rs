@@ -8,7 +8,7 @@ use super::super::payment_request;
 use super::common::format_amount;
 use super::policies::TaprootSpendInfo;
 use super::script_configs::{ValidatedScriptConfig, ValidatedScriptConfigWithKeypath};
-use super::{bip143, bip322, bip341, common, keypath};
+use super::{bip143, bip322, bip341, common, keypath, musig2};
 
 use crate::hal::Ui;
 use crate::keystore::Compute;
@@ -268,9 +268,6 @@ fn validate_input(
     params: &super::params::Params,
     script_config_account: &ValidatedScriptConfigWithKeypath,
 ) -> Result<(), Error> {
-    if input.musig2.is_some() {
-        return Err(Error::Disabled);
-    }
     if input.prev_out_value == 0 {
         return Err(Error::InvalidInput);
     }
@@ -512,6 +509,7 @@ async fn validate_input_script_configs<'a>(
     coin_params: &super::params::Params,
     script_configs: &'a [pb::BtcScriptConfigWithKeypath],
     is_bip322: bool,
+    is_musig2: bool,
 ) -> Result<Vec<ValidatedScriptConfigWithKeypath<'a>>, Error> {
     if script_configs.is_empty() {
         return Err(Error::InvalidInput);
@@ -529,6 +527,30 @@ async fn validate_input_script_configs<'a>(
     } else {
         "Spend from"
     };
+
+    if is_musig2 {
+        for config in &script_configs {
+            match &config.config {
+                ValidatedScriptConfig::SimpleType(_) => (),
+                ValidatedScriptConfig::Policy {
+                    name,
+                    parsed_policy,
+                } => {
+                    parsed_policy
+                        .confirm(
+                            hal,
+                            confirm_title,
+                            coin_params,
+                            name,
+                            super::policies::Mode::Basic,
+                        )
+                        .await?;
+                }
+                ValidatedScriptConfig::Multisig { .. } => return Err(Error::InvalidInput),
+            }
+        }
+        return Ok(script_configs);
+    }
 
     // If there are multiple script configs, only SimpleType (single sig, no additional inputs)
     // configs are allowed, so e.g. mixing p2wpkh and pw2wpkh-p2sh is okay, but mixing p2wpkh with
@@ -962,6 +984,9 @@ async fn process_bip322(
         }
 
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
+        if tx_input.musig2.is_some() {
+            return Err(Error::InvalidInput);
+        }
         let script_config_account = validated_script_configs
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
@@ -1076,6 +1101,9 @@ async fn process_bip322(
     let mut proven_sum_pass2: u64 = 0;
     for input_index in 0..request.num_inputs {
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
+        if tx_input.musig2.is_some() {
+            return Err(Error::InvalidInput);
+        }
         let script_config_account = validated_script_configs
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
@@ -1175,12 +1203,20 @@ async fn _process(
     hal: &mut impl crate::hal::Hal,
     request: &pb::BtcSignInitRequest,
 ) -> Result<Response, Error> {
-    if request.musig2.is_some() {
-        return Err(Error::Disabled);
-    }
     if crate::keystore::is_locked() {
         return Err(Error::InvalidState);
     }
+    if let Some(init) = &request.musig2 {
+        if pb::btc_mu_sig2_init::Phase::try_from(init.phase)? == pb::btc_mu_sig2_init::Phase::Abort
+        {
+            musig2::abort(&init.session_id)?;
+            return Ok(Response::BtcSignNext(pb::BtcSignNextResponse {
+                r#type: NextType::Done as _,
+                ..Default::default()
+            }));
+        }
+    }
+    let mut musig_round = musig2::Round::begin(hal, request).await?;
     // Validate the coin.
     let coin = pb::BtcCoin::try_from(request.coin)?;
     let coin_params = super::params::get(coin);
@@ -1196,8 +1232,14 @@ async fn _process(
     if request.num_inputs < 1 || request.num_outputs < 1 {
         return Err(Error::InvalidInput);
     }
-    let validated_script_configs =
-        validate_input_script_configs(hal, coin_params, &request.script_configs, is_bip322).await?;
+    let validated_script_configs = validate_input_script_configs(
+        hal,
+        coin_params,
+        &request.script_configs,
+        is_bip322,
+        musig_round.is_some(),
+    )
+    .await?;
     let validated_output_script_configs =
         validate_script_configs(hal, coin_params, &request.output_script_configs).await?;
 
@@ -1238,6 +1280,10 @@ async fn _process(
         wrap: false,
     };
 
+    if let Some(round) = &musig_round {
+        next_response.next.musig2_session_id = round.session_id().to_vec();
+    }
+
     // Will contain the sum of all spent output values in the first inputs pass.
     let mut inputs_sum_pass1: u64 = 0;
 
@@ -1271,6 +1317,15 @@ async fn _process(
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
         validate_input(&tx_input, coin_params, script_config_account)?;
+        if let Some(round) = musig_round.as_mut() {
+            round.input(&tx_input)?;
+            if tx_input.musig2.is_some() {
+                musig2::context(&script_config_account.config, &tx_input)?;
+            }
+        } else if tx_input.musig2.is_some() {
+            return Err(Error::InvalidInput);
+        }
+
         if tx_input.sequence < 0xffffffff {
             locktime_applies = true;
         }
@@ -1375,6 +1430,9 @@ async fn _process(
     let mut hasher_outputs = Sha256::new();
     for output_index in 0..request.num_outputs {
         let tx_output = get_tx_output(output_index, &mut next_response).await?;
+        if let Some(round) = musig_round.as_mut() {
+            round.output(&tx_output);
+        }
         if output_index == 0 {
             // Stop rendering inputs progress update.
             drop(progress_component.take());
@@ -1656,6 +1714,9 @@ async fn _process(
         fee_percentage_basis,
     )
     .await?;
+    if let Some(round) = musig_round.as_mut() {
+        round.approve()?;
+    }
     hal.ui().status("Transaction\nconfirmed", true).await;
 
     let tx_hashes = TxHashes {
@@ -1686,6 +1747,9 @@ async fn _process(
             .ok_or(Error::InvalidInput)?;
 
         validate_input(&tx_input, coin_params, script_config_account)?;
+        if let Some(round) = musig_round.as_ref() {
+            round.check_input(input_index, &tx_input)?;
+        }
 
         inputs_sum_pass2 = inputs_sum_pass2
             .checked_add(tx_input.prev_out_value)
@@ -1694,18 +1758,75 @@ async fn _process(
             return Err(Error::InvalidInput);
         }
 
-        // Boxed so that the signing state does not enlarge the future of every request.
-        Box::pin(sign_input(
-            hal,
-            &mut xpub_cache,
-            request,
-            &tx_hashes,
-            input_index,
-            &tx_input,
-            script_config_account,
-            &mut next_response,
-        ))
-        .await?;
+        if let Some(metadata) = &tx_input.musig2 {
+            let round = musig_round.as_mut().ok_or(Error::InvalidInput)?;
+            let context = musig2::context(&script_config_account.config, &tx_input)?;
+            let sighash = bip341::sighash(&bip341::Args {
+                version: request.version,
+                locktime: request.locktime,
+                hash_prevouts: tx_hashes.hash_prevouts,
+                hash_amounts: tx_hashes.hash_amounts,
+                hash_scriptpubkeys: tx_hashes.hash_scriptpubkeys,
+                hash_sequences: tx_hashes.hash_sequence,
+                hash_outputs: tx_hashes.hash_outputs,
+                input_index,
+                tapleaf_hash: context.tapleaf_hash,
+            });
+            let result = if round.generate {
+                pb::btc_mu_sig2_result::Result::PublicNonce(
+                    round
+                        .nonce(hal, input_index, &context, &sighash)
+                        .await?
+                        .to_vec(),
+                )
+            } else {
+                // This is a BIP373 public-nonce exchange, independent of ECDSA anti-klepto.
+                let request = get_request(
+                    NextType::Musig2Nonces,
+                    input_index,
+                    None,
+                    &mut next_response,
+                )
+                .await?;
+                next_response.wrap = true;
+                let Request::Btc(pb::BtcRequest {
+                    request: Some(pb::btc_request::Request::Musig2Nonces(request)),
+                }) = request
+                else {
+                    return Err(Error::InvalidState);
+                };
+                let nonces = musig2::order_nonces(input_index, metadata, &context, &request)?;
+                pb::btc_mu_sig2_result::Result::PartialSignature(
+                    round
+                        .sign(hal, input_index, &context, &sighash, &nonces)
+                        .await?
+                        .to_vec(),
+                )
+            };
+            next_response.next.musig2_result = Some(pb::BtcMuSig2Result {
+                input_index,
+                participant_pubkey: context.participant.to_vec(),
+                context_key: metadata.context_key.clone(),
+                tapleaf_hash: metadata.tapleaf_hash.clone(),
+                result: Some(result),
+            });
+        } else if musig_round.as_ref().is_some_and(|round| round.generate) {
+            // Nonce mode never emits ordinary signatures. They are produced after
+            // transaction approval in the signing round alongside MuSig partials.
+        } else {
+            // Boxed so that the signing state does not enlarge the future of every request.
+            Box::pin(sign_input(
+                hal,
+                &mut xpub_cache,
+                request,
+                &tx_hashes,
+                input_index,
+                &tx_input,
+                script_config_account,
+                &mut next_response,
+            ))
+            .await?;
+        }
 
         // Update progress.
         if let Some(ref mut c) = progress_component {
@@ -1717,6 +1838,9 @@ async fn _process(
         return Err(Error::InvalidInput);
     }
 
+    if let Some(round) = musig_round {
+        next_response.next.musig2_session_id = round.finish()?.to_vec();
+    }
     next_response.next.r#type = NextType::Done as _;
     Ok(next_response.to_protobuf())
 }
@@ -4086,3 +4210,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod musig2_tests;

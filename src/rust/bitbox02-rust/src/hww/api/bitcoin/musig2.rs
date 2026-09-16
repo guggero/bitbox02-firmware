@@ -76,6 +76,11 @@ fn input_commitment(input: &pb::BtcSignInputRequest) -> [u8; 32] {
 }
 
 impl Round {
+    /// Public correlation token, also acknowledges support before inputs arrive.
+    pub fn session_id(&self) -> &[u8; 32] {
+        &self.pending.id
+    }
+
     /// Reserve a new round or take the existing session before processing any
     /// host data. A signing error therefore cannot leave reusable nonce state.
     pub async fn begin(

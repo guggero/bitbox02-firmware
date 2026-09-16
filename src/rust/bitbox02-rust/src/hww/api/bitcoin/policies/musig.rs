@@ -216,6 +216,17 @@ impl ParsedPolicy<'_> {
             return Err(Error::InvalidInput);
         };
         let index = selector[selector.len() - 1];
+        // The sighash and change UI resolve this selector across the whole
+        // policy. Reject ambiguous branches that resolve to a different spend.
+        if get_change_and_address_index(
+            self.iter_pk(),
+            &self.policy.keys,
+            &self.is_our_key,
+            selector,
+        )? != (change, index)
+        {
+            return Err(Error::InvalidInput);
+        }
         let (mut aggregate, participants, bare_key) =
             placeholder.derive(&self.policy.keys, change, index)?;
         let internal_key = aggregate.public_key().serialize();

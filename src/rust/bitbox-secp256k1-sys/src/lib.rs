@@ -127,3 +127,11 @@ unsafe extern "C" {
         sig: *const secp256k1_musig_partial_sig,
     ) -> c_int;
 }
+
+unsafe extern "C" {
+    pub fn secp256k1_musig_partial_sig_parse(
+        ctx: *const Context,
+        signature: *mut secp256k1_musig_partial_sig,
+        bytes: *const u8,
+    ) -> c_int;
+}

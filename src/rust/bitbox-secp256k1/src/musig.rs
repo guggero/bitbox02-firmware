@@ -550,3 +550,64 @@ mod tests {
         assert!(PublicNonce::parse(&[0; 66]).is_err());
     }
 }
+
+/// Verify a peer's contribution against independently computed transaction data.
+/// Only test/host builds need this; firmware already verifies its own contribution.
+#[cfg(any(test, feature = "testing"))]
+pub fn verify_partial(
+    keys: &KeyAgg,
+    nonces: &[[u8; 66]],
+    message: &[u8; 32],
+    signer: usize,
+    signature: &[u8; 32],
+) -> Result<(), ()> {
+    if nonces.len() != keys.keys.len() || signer >= nonces.len() {
+        return Err(());
+    }
+    let nonces = nonces
+        .iter()
+        .map(PublicNonce::parse)
+        .collect::<Result<Vec<_>, _>>()?;
+    let pointers: Vec<_> = nonces.iter().map(|nonce| &nonce.0 as *const _).collect();
+    let mut aggregate = ffi::secp256k1_musig_aggnonce { data: [0; 132] };
+    let mut session = ffi::secp256k1_musig_session { data: [0; 133] };
+    let mut sig = ffi::secp256k1_musig_partial_sig { data: [0; 36] };
+    // SAFETY: the nonempty list contains parsed nonce objects; the cache is
+    // initialized and all buffers have the fixed lengths required by the ABI.
+    unsafe {
+        assert_eq!(
+            ffi::secp256k1_musig_nonce_agg(
+                SECP256K1.ctx().as_ptr(),
+                &mut aggregate,
+                pointers.as_ptr(),
+                pointers.len()
+            ),
+            1
+        );
+        if ffi::secp256k1_musig_nonce_process(
+            SECP256K1.ctx().as_ptr(),
+            &mut session,
+            &aggregate,
+            message.as_ptr(),
+            &keys.cache,
+            ptr::null(),
+        ) != 1
+            || ffi::secp256k1_musig_partial_sig_parse(
+                SECP256K1.ctx().as_ptr(),
+                &mut sig,
+                signature.as_ptr(),
+            ) != 1
+            || ffi::secp256k1_musig_partial_sig_verify(
+                SECP256K1.ctx().as_ptr(),
+                &sig,
+                &nonces[signer].0,
+                keys.keys[signer].as_c_ptr(),
+                &keys.cache,
+                &session,
+            ) != 1
+        {
+            return Err(());
+        }
+    }
+    Ok(())
+}
