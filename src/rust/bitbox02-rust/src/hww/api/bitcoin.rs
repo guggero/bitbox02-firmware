@@ -10,6 +10,7 @@ mod bip341;
 pub mod common;
 pub mod keypath;
 mod multisig;
+pub(crate) mod musig2;
 pub mod params;
 mod policies;
 mod registration;
