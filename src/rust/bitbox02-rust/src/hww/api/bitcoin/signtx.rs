@@ -1849,7 +1849,9 @@ pub async fn process(
     hal: &mut impl crate::hal::Hal,
     request: &pb::BtcSignInitRequest,
 ) -> Result<Response, Error> {
-    let result = _process(hal, request).await;
+    // The transaction state spans both streaming passes. Keep the enlarged
+    // MuSig2 workflow off the caller's stack and outer USB future.
+    let result = alloc::boxed::Box::pin(_process(hal, request)).await;
     if let Err(Error::UserAbort) = result {
         hal.ui().status("Transaction\ncanceled", false).await;
     }
