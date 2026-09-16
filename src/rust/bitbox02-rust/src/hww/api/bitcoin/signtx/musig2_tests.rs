@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+extern crate std;
+
 use super::super::policies;
 use super::*;
 use crate::hal::{Memory, testing::TestingHal};
@@ -20,6 +22,7 @@ struct Fixture {
     contexts: Vec<policies::musig::SigningContext>,
     messages: Vec<[u8; 32]>,
     other_secret: [u8; 32],
+    tweaks: Vec<Vec<[u8; 32]>>,
 }
 
 async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
@@ -62,6 +65,7 @@ async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
     let mut inputs = Vec::new();
     let mut contexts = Vec::new();
     let mut prevouts = Vec::new();
+    let mut tweaks = Vec::new();
     // Two inputs exercise piggybacked results and the same participant key with
     // distinct nonces. The second input chooses a different aggregate child.
     for index in 0..2 {
@@ -74,6 +78,41 @@ async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
             ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
                 bitcoin::secp256k1::XOnlyPublicKey::from_slice(&tr.output_key()).unwrap(),
             ));
+        // Reconstruct the tweak sequence independently for reference interop.
+        let mut aggregate_xpub = Xpub {
+            network: bitcoin::NetworkKind::Main,
+            depth: 0,
+            parent_fingerprint: Default::default(),
+            child_number: 0.into(),
+            public_key: bitcoin::secp256k1::PublicKey::from_slice(&context.bare_key).unwrap(),
+            chain_code: hex_lit::hex!(
+                "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
+            )
+            .into(),
+        };
+        let mut input_tweaks = Vec::new();
+        for child in [0, index] {
+            let child = bitcoin::bip32::ChildNumber::from_normal_idx(child).unwrap();
+            input_tweaks.push(
+                aggregate_xpub
+                    .ckd_pub_tweak(child)
+                    .unwrap()
+                    .0
+                    .secret_bytes(),
+            );
+            aggregate_xpub = aggregate_xpub.ckd_pub(SECP256K1, child).unwrap();
+        }
+        assert_eq!(aggregate_xpub.public_key.serialize(), context.internal_key);
+        if !leaf {
+            input_tweaks.push(
+                bitcoin::TapTweakHash::from_key_and_tweak(
+                    aggregate_xpub.public_key.x_only_public_key().0,
+                    None,
+                )
+                .to_byte_array(),
+            );
+        }
+        tweaks.push(input_tweaks);
         prevouts.push(TxOut {
             value: Amount::from_sat(100_000),
             script_pubkey: script,
@@ -173,6 +212,7 @@ async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
         contexts,
         messages,
         other_secret: other.private_key.secret_bytes(),
+        tweaks,
     }
 }
 
@@ -242,10 +282,11 @@ async fn test_musig2_signtx() {
         assert_eq!(id.len(), 32);
         let mut requests = Vec::new();
         let mut ordered = Vec::new();
-        for i in 0..2 {
+        let mut peer_signatures = Vec::new();
+        for (i, result) in public.iter().enumerate() {
             let ctx = &fixture.contexts[i];
-            assert_eq!(public[i].input_index, i as u32);
-            let Contribution::PublicNonce(ours) = public[i].result.as_ref().unwrap() else {
+            assert_eq!(result.input_index, i as u32);
+            let Contribution::PublicNonce(ours) = result.result.as_ref().unwrap() else {
                 panic!()
             };
             let other = SecretNonce::generate(
@@ -284,6 +325,16 @@ async fn test_musig2_signtx() {
                 tapleaf_hash: public[i].tapleaf_hash.clone(),
                 nonces: records,
             });
+            peer_signatures.push(
+                other
+                    .sign(
+                        &fixture.other_secret,
+                        &ctx.aggregate,
+                        &nonces,
+                        &fixture.messages[i],
+                    )
+                    .unwrap(),
+            );
             ordered.push(nonces);
         }
         fixture.init.musig2 = Some(pb::BtcMuSig2Init {
@@ -310,6 +361,35 @@ async fn test_musig2_signtx() {
                 &fixture.messages[i],
                 signer,
                 sig.as_slice().try_into().unwrap(),
+            )
+            .unwrap();
+        }
+        // Optional public-only transcript for an independent BIP327 checker.
+        // No firmware or participant private key/nonce is included.
+        if let Ok(directory) = std::env::var("BITBOX_MUSIG2_FIXTURES") {
+            let records: Vec<_> = fixture.contexts.iter().enumerate().map(|(i, ctx)| {
+                let Contribution::PartialSignature(sig) = partials[i].result.as_ref().unwrap() else { panic!() };
+                let signer = ctx.participants.iter().position(|key| key == &ctx.participant).unwrap();
+                let mut signatures = vec![hex::encode(peer_signatures[i]); 2];
+                signatures[signer] = hex::encode(sig);
+                serde_json::json!({
+                    "pubkeys": ctx.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "pubnonces": ordered[i].iter().map(hex::encode).collect::<Vec<_>>(),
+                    "tweaks": fixture.tweaks[i].iter().map(hex::encode).collect::<Vec<_>>(),
+                    "is_xonly": if leaf { vec![false, false] } else { vec![false, false, true] },
+                    "message": hex::encode(fixture.messages[i]),
+                    "aggregate_key": hex::encode(ctx.aggregate.public_key().serialize()),
+                    "partial_signatures": signatures,
+                })
+            }).collect();
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(if leaf {
+                    "scriptpath.json"
+                } else {
+                    "keypath.json"
+                }),
+                serde_json::to_vec_pretty(&records).unwrap(),
             )
             .unwrap();
         }
@@ -356,4 +436,37 @@ async fn test_musig2_signtx_rejects_changes() {
         process(&mut hal, &fixture.init).await,
         Err(Error::InvalidState)
     );
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_user_abort() {
+    for signing in [false, true] {
+        let mut hal = TestingHal::new();
+        let mut fixture = fixture(&mut hal, false).await;
+        if signing {
+            let (_, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+            fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+                phase: Phase::Sign as _,
+                session_id: id,
+            });
+        }
+        // Reject the first authorization in this round. Signing takes ownership
+        // before the UI, so an aborted second round cannot be resumed.
+        hal.ui = crate::hal::testing::ui::TestingUi::new();
+        hal.ui.abort_nth(0);
+        assert_eq!(
+            run(&mut hal, &fixture, vec![], false).await,
+            Err(Error::UserAbort)
+        );
+        if signing {
+            assert_eq!(
+                process(&mut hal, &fixture.init).await,
+                Err(Error::InvalidState)
+            );
+        } else {
+            hal.ui = crate::hal::testing::ui::TestingUi::new();
+            run(&mut hal, &fixture, vec![], false).await.unwrap();
+            musig2::clear();
+        }
+    }
 }

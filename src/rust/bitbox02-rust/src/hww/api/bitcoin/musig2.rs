@@ -494,4 +494,70 @@ mod tests {
             crate::keystore::testing::mock_unlocked();
         }
     }
+
+    #[async_test::test]
+    async fn test_round_limits_and_approval() {
+        let mut hal = TestingHal::new();
+        let (context, mut request, input) = fixture(&mut hal).await;
+        request.num_inputs = MAX_INPUTS as u32 + 1;
+        assert!(Round::begin(&mut hal, &request).await.is_err());
+        request.num_inputs = MAX_INPUTS as u32;
+        let mut round = Round::begin(&mut hal, &request).await.unwrap().unwrap();
+        assert!(round.nonce(&mut hal, 0, &context, &[42; 32]).await.is_err());
+        assert!(round.approve().is_err());
+        for _ in 0..MAX_NONCES {
+            round.input(&input).unwrap();
+        }
+        assert!(round.input(&input).is_err());
+        drop(round);
+        // A dropped nonce round leaves no pending storage, even before approval.
+        assert!(PENDING.0.borrow().is_none());
+        request.contains_silent_payment_outputs = true;
+        assert!(Round::begin(&mut hal, &request).await.is_err());
+        request.contains_silent_payment_outputs = false;
+        request.bip322_message = Some(vec![]);
+        assert!(Round::begin(&mut hal, &request).await.is_err());
+    }
+
+    #[async_test::test]
+    async fn test_order_nonces_rejects_wrong_contexts() {
+        let mut hal = TestingHal::new();
+        let (context, _, _) = fixture(&mut hal).await;
+        let metadata = pb::BtcMuSig2Input {
+            context_key: context.bare_key.to_vec(),
+            tapleaf_hash: Some(vec![3; 32]),
+            ..Default::default()
+        };
+        let request = pb::BtcMuSig2NoncesRequest {
+            input_index: 2,
+            context_key: metadata.context_key.clone(),
+            tapleaf_hash: metadata.tapleaf_hash.clone(),
+            nonces: context
+                .participants
+                .iter()
+                .map(|key| pb::BtcMuSig2Nonce {
+                    participant_pubkey: key.to_vec(),
+                    public_nonce: vec![4; 66],
+                })
+                .collect(),
+        };
+        order_nonces(2, &metadata, &context, &request).unwrap();
+        for mutation in 0..7 {
+            let mut request = request.clone();
+            match mutation {
+                0 => request.input_index += 1,
+                1 => request.context_key[1] ^= 1,
+                2 => request.tapleaf_hash = None,
+                3 => {
+                    request.nonces.pop();
+                }
+                4 => request.nonces[1] = request.nonces[0].clone(),
+                5 => request.nonces[1].participant_pubkey[1] ^= 1,
+                _ => {
+                    request.nonces[0].public_nonce.pop();
+                }
+            }
+            assert!(order_nonces(2, &metadata, &context, &request).is_err());
+        }
+    }
 }
