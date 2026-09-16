@@ -338,7 +338,8 @@ pub async fn process_api(
         | Request::PrevtxInput(_)
         | Request::PrevtxOutput(_)
         | Request::AntikleptoSignature(_)
-        | Request::PaymentRequest(_) => Err(Error::InvalidState),
+        | Request::PaymentRequest(_)
+        | Request::Musig2Nonces(_) => Err(Error::InvalidState),
     }
 }
 

@@ -268,6 +268,9 @@ fn validate_input(
     params: &super::params::Params,
     script_config_account: &ValidatedScriptConfigWithKeypath,
 ) -> Result<(), Error> {
+    if input.musig2.is_some() {
+        return Err(Error::Disabled);
+    }
     if input.prev_out_value == 0 {
         return Err(Error::InvalidInput);
     }
@@ -1172,6 +1175,9 @@ async fn _process(
     hal: &mut impl crate::hal::Hal,
     request: &pb::BtcSignInitRequest,
 ) -> Result<Response, Error> {
+    if request.musig2.is_some() {
+        return Err(Error::Disabled);
+    }
     if crate::keystore::is_locked() {
         return Err(Error::InvalidState);
     }
@@ -1878,6 +1884,7 @@ mod tests {
                 inputs: vec![
                     TxInput {
                         input: pb::BtcSignInputRequest {
+                            musig2: None,
                             prev_out_hash: vec![
                                 0x45, 0x17, 0x74, 0x50, 0x1b, 0xaf, 0xdf, 0xf7, 0x46, 0x9, 0xe,
                                 0x6, 0x16, 0xd9, 0x5e, 0xd0, 0x80, 0xd7, 0x82, 0x9a, 0xfe, 0xa2,
@@ -1931,6 +1938,7 @@ mod tests {
                     },
                     TxInput {
                         input: pb::BtcSignInputRequest {
+                            musig2: None,
                             prev_out_hash: vec![
                                 0x40, 0x9b, 0x4f, 0x56, 0xca, 0x9f, 0x6, 0xcb, 0x88, 0x28, 0x3,
                                 0xad, 0x55, 0x4b, 0xeb, 0x1d, 0x9e, 0xf8, 0x78, 0x7, 0xf0, 0x52,
@@ -2037,6 +2045,7 @@ mod tests {
                 version: 2,
                 inputs: vec![TxInput {
                     input: pb::BtcSignInputRequest {
+                        musig2: None,
                         prev_out_hash: vec![
                             0x41, 0x3b, 0x8e, 0x74, 0x05, 0x15, 0x96, 0x6b, 0x20, 0x2b, 0x24, 0xc3,
                             0x19, 0xfc, 0xf3, 0x5f, 0xc5, 0x37, 0x6e, 0xb2, 0x71, 0x95, 0xb8, 0x76,
@@ -2107,6 +2116,7 @@ mod tests {
 
         fn init_request(&self) -> pb::BtcSignInitRequest {
             pb::BtcSignInitRequest {
+                musig2: None,
                 coin: self.coin as _,
                 script_configs: vec![pb::BtcScriptConfigWithKeypath {
                     script_config: Some(pb::BtcScriptConfig {
@@ -2140,6 +2150,7 @@ mod tests {
             keypath_account: &[u32],
         ) -> pb::BtcSignInitRequest {
             pb::BtcSignInitRequest {
+                musig2: None,
                 coin: self.coin as _,
                 script_configs: vec![pb::BtcScriptConfigWithKeypath {
                     script_config: Some(pb::BtcScriptConfig {
@@ -2367,6 +2378,7 @@ mod tests {
 
         TxInput {
             input: pb::BtcSignInputRequest {
+                musig2: None,
                 prev_out_hash: input.prev_out_hash.to_byte_array().to_vec(),
                 prev_out_index: input.prev_out_index,
                 prev_out_value: input.prev_out_value,
@@ -2478,6 +2490,7 @@ mod tests {
         request: &btc_test_vectors::FirmwareSignRequest,
     ) -> pb::BtcSignInitRequest {
         pb::BtcSignInitRequest {
+            musig2: None,
             coin: vector_coin(vector.coin) as _,
             script_configs: request
                 .script_configs
@@ -2974,6 +2987,7 @@ mod tests {
         *crate::hww::MOCK_NEXT_REQUEST.0.borrow_mut() = None;
 
         let init_req_valid = pb::BtcSignInitRequest {
+            musig2: None,
             coin: pb::BtcCoin::Btc as _,
             script_configs: vec![pb::BtcScriptConfigWithKeypath {
                 script_config: Some(pb::BtcScriptConfig {
@@ -3174,6 +3188,7 @@ mod tests {
                 process(
                     &mut TestingHal::new(),
                     &pb::BtcSignInitRequest {
+                        musig2: None,
                         coin: pb::BtcCoin::Ltc as _,
                         script_configs: vec![pb::BtcScriptConfigWithKeypath {
                             script_config: Some(pb::BtcScriptConfig {
@@ -3310,6 +3325,7 @@ mod tests {
         // transaction.
         let mut inputs = vec![TxInput {
             input: pb::BtcSignInputRequest {
+                musig2: None,
                 prev_out_hash: bip322::create_to_spend_txid(message, &scripts[0]).to_vec(),
                 prev_out_index: 0,
                 prev_out_value: 0,
@@ -3327,6 +3343,7 @@ mod tests {
         for (index, coin) in coins.iter().enumerate() {
             let mut input = TxInput {
                 input: pb::BtcSignInputRequest {
+                    musig2: None,
                     prev_out_hash: vec![],
                     prev_out_index: 0,
                     prev_out_value: coin.value,
@@ -3401,6 +3418,7 @@ mod tests {
         }
 
         let init_request = pb::BtcSignInitRequest {
+            musig2: None,
             coin: coin as _,
             script_configs: vec![pb::BtcScriptConfigWithKeypath {
                 script_config: Some(pb::BtcScriptConfig {

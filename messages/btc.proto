@@ -122,6 +122,8 @@ message BTCSignInitRequest {
   // Carries the message from the PSBT global field
   // PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE (0x09) defined in BIP-322 v1.0.0.
   optional bytes bip322_message = 11;
+  // Two BIP373 signing rounds; absent preserves ordinary signing.
+  BTCMuSig2Init musig2 = 12;
 }
 
 message BTCSignNextResponse {
@@ -135,6 +137,7 @@ message BTCSignNextResponse {
     PREVTX_OUTPUT = 5;
     HOST_NONCE = 6;
     PAYMENT_REQUEST = 7;
+    MUSIG2_NONCES = 8;
   }
   Type type = 1;
   // index of the current input or output
@@ -148,6 +151,8 @@ message BTCSignNextResponse {
   // Generated output. The host *must* verify its correctness using `silent_payment_dleq_proof`.
   bytes generated_output_pkscript = 7;
   bytes silent_payment_dleq_proof = 8;
+  bytes musig2_session_id = 9;
+  BTCMuSig2Result musig2_result = 10;
 }
 
 message BTCSignInputRequest {
@@ -161,6 +166,62 @@ message BTCSignInputRequest {
   // If omitted, the signature uses the historical deterministic zero-contribution S2C fallback.
   // This differs from plain RFC6979 and does not provide anti-klepto protection.
   AntiKleptoHostNonceCommitment host_nonce_commitment = 8;
+  BTCMuSig2Input musig2 = 9;
+}
+
+// Secret nonces remain in volatile device memory between these rounds.
+// Cancel, lock, disconnect or a new Noise session requires fresh nonces.
+message BTCMuSig2Init {
+  enum Phase {
+    NONCE = 0;
+    SIGN = 1;
+    ABORT = 2;
+  }
+  Phase phase = 1;
+  // Empty for NONCE. The device-generated 32-byte handle for SIGN/ABORT.
+  // This is host coordination state, not a standardized PSBT field.
+  bytes session_id = 2;
+}
+
+message BTCMuSig2Input {
+  // Exact BIP388 key expression from the registered policy, e.g. musig(@0,@1)/**.
+  // BTCSignInputRequest.keypath is an address selector: participant origin path
+  // followed by aggregate branch/index. Only the origin derives the private key.
+  string key_expression = 1;
+  // PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: bare KeyAgg key and ordered keys.
+  bytes aggregate_key = 2;
+  repeated bytes participant_pubkeys = 3;
+  // Aggregate key in the BIP373 nonce/signature key-data tuple. It may be the
+  // bare aggregate, its derived internal key, or its tweaked output key; the
+  // device verifies the relationship to the registered policy.
+  bytes context_key = 4;
+  // Omitted for key-path signing; exactly 32 bytes for a policy tapscript leaf.
+  optional bytes tapleaf_hash = 5;
+}
+
+message BTCMuSig2Nonce {
+  bytes participant_pubkey = 1; // compressed, 33 bytes
+  bytes public_nonce = 2; // two compressed points, 66 bytes
+}
+
+message BTCMuSig2NoncesRequest {
+  uint32 input_index = 1;
+  bytes context_key = 2;
+  optional bytes tapleaf_hash = 3;
+  // Exactly one record per participant, in arbitrary map order, including ours.
+  repeated BTCMuSig2Nonce nonces = 4;
+}
+
+message BTCMuSig2Result {
+  // Identifies this result, independently of the next requested input index.
+  uint32 input_index = 1;
+  bytes participant_pubkey = 2;
+  bytes context_key = 3;
+  optional bytes tapleaf_hash = 4;
+  oneof result {
+    bytes public_nonce = 5; // PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
+    bytes partial_signature = 6; // PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
+  }
 }
 
 enum BTCOutputType {
@@ -310,6 +371,7 @@ message BTCRequest {
     AntiKleptoSignatureRequest antiklepto_signature = 7;
     BTCPaymentRequestRequest payment_request = 8;
     BTCXpubsRequest xpubs = 9;
+    BTCMuSig2NoncesRequest musig2_nonces = 10;
   }
 }
 
