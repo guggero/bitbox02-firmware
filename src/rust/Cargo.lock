@@ -284,9 +284,19 @@ dependencies = [
 name = "bitbox-secp256k1"
 version = "0.1.0"
 dependencies = [
+ "bitbox-secp256k1-sys",
  "bitcoin",
  "cc",
  "hex_lit",
+ "zeroize",
+]
+
+[[package]]
+name = "bitbox-secp256k1-sys"
+version = "0.1.0"
+dependencies = [
+ "bitcoin",
+ "zeroize",
 ]
 
 [[package]]

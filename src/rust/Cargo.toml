@@ -29,6 +29,7 @@ members = [
     "bitbox-platform-stm32u5-sys",
     "bitbox-proto",
     "bitbox-secp256k1",
+    "bitbox-secp256k1-sys",
     "bitbox-securechip",
     "bitbox-securechip-sys",
     "bitbox-test-vectors",

@@ -12,6 +12,8 @@ license = "Apache-2.0"
 doctest = false
 
 [dependencies]
+bitbox-secp256k1-sys = { path = "../bitbox-secp256k1-sys" }
+zeroize = { workspace = true }
 bitcoin = { workspace = true }
 
 [dev-dependencies]

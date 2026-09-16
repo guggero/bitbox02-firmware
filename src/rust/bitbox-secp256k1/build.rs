@@ -28,6 +28,7 @@ fn main() {
         .define("ENABLE_MODULE_RECOVERY", Some("1")) // needed only in Rust unit tests.
         .define("ENABLE_MODULE_EXTRAKEYS", Some("1"))
         .define("ENABLE_MODULE_SCHNORRSIG", Some("1"))
+        .define("ENABLE_MODULE_MUSIG", Some("1"))
         .define("ENABLE_MODULE_ECDSA_ADAPTOR", Some("1"))
         .define("ENABLE_MODULE_ECDSA_S2C", Some("1"));
 

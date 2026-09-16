@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "bitbox-secp256k1-sys"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Bindings to the vendored libsecp256k1-zkp MuSig2 module"
+
+[dependencies]
+bitcoin = { workspace = true }
+zeroize = { workspace = true }
