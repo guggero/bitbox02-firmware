@@ -340,6 +340,7 @@ class BTCSignInitRequest(google.protobuf.message.Message):
     CONTAINS_SILENT_PAYMENT_OUTPUTS_FIELD_NUMBER: builtins.int
     OUTPUT_SCRIPT_CONFIGS_FIELD_NUMBER: builtins.int
     BIP322_MESSAGE_FIELD_NUMBER: builtins.int
+    MUSIG2_FIELD_NUMBER: builtins.int
     coin: global___BTCCoin.ValueType
     version: builtins.int
     """must be 1 or 2"""
@@ -365,6 +366,10 @@ class BTCSignInitRequest(google.protobuf.message.Message):
         necessarily the same account (as defined by `script_configs` above).
         """
 
+    @property
+    def musig2(self) -> global___BTCMuSig2Init:
+        """Two BIP373 signing rounds; absent preserves ordinary signing."""
+
     def __init__(
         self,
         *,
@@ -378,9 +383,10 @@ class BTCSignInitRequest(google.protobuf.message.Message):
         contains_silent_payment_outputs: builtins.bool = ...,
         output_script_configs: collections.abc.Iterable[global___BTCScriptConfigWithKeypath] | None = ...,
         bip322_message: builtins.bytes | None = ...,
+        musig2: global___BTCMuSig2Init | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["_bip322_message", b"_bip322_message", "bip322_message", b"bip322_message"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_bip322_message", b"_bip322_message", "bip322_message", b"bip322_message", "coin", b"coin", "contains_silent_payment_outputs", b"contains_silent_payment_outputs", "format_unit", b"format_unit", "locktime", b"locktime", "num_inputs", b"num_inputs", "num_outputs", b"num_outputs", "output_script_configs", b"output_script_configs", "script_configs", b"script_configs", "version", b"version"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["_bip322_message", b"_bip322_message", "bip322_message", b"bip322_message", "musig2", b"musig2"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_bip322_message", b"_bip322_message", "bip322_message", b"bip322_message", "coin", b"coin", "contains_silent_payment_outputs", b"contains_silent_payment_outputs", "format_unit", b"format_unit", "locktime", b"locktime", "musig2", b"musig2", "num_inputs", b"num_inputs", "num_outputs", b"num_outputs", "output_script_configs", b"output_script_configs", "script_configs", b"script_configs", "version", b"version"]) -> None: ...
     def WhichOneof(self, oneof_group: typing.Literal["_bip322_message", b"_bip322_message"]) -> typing.Literal["bip322_message"] | None: ...
 
 global___BTCSignInitRequest = BTCSignInitRequest
@@ -404,6 +410,7 @@ class BTCSignNextResponse(google.protobuf.message.Message):
         PREVTX_OUTPUT: BTCSignNextResponse._Type.ValueType  # 5
         HOST_NONCE: BTCSignNextResponse._Type.ValueType  # 6
         PAYMENT_REQUEST: BTCSignNextResponse._Type.ValueType  # 7
+        MUSIG2_NONCES: BTCSignNextResponse._Type.ValueType  # 8
 
     class Type(_Type, metaclass=_TypeEnumTypeWrapper): ...
     INPUT: BTCSignNextResponse.Type.ValueType  # 0
@@ -415,6 +422,7 @@ class BTCSignNextResponse(google.protobuf.message.Message):
     PREVTX_OUTPUT: BTCSignNextResponse.Type.ValueType  # 5
     HOST_NONCE: BTCSignNextResponse.Type.ValueType  # 6
     PAYMENT_REQUEST: BTCSignNextResponse.Type.ValueType  # 7
+    MUSIG2_NONCES: BTCSignNextResponse.Type.ValueType  # 8
 
     TYPE_FIELD_NUMBER: builtins.int
     INDEX_FIELD_NUMBER: builtins.int
@@ -424,6 +432,8 @@ class BTCSignNextResponse(google.protobuf.message.Message):
     ANTI_KLEPTO_SIGNER_COMMITMENT_FIELD_NUMBER: builtins.int
     GENERATED_OUTPUT_PKSCRIPT_FIELD_NUMBER: builtins.int
     SILENT_PAYMENT_DLEQ_PROOF_FIELD_NUMBER: builtins.int
+    MUSIG2_SESSION_ID_FIELD_NUMBER: builtins.int
+    MUSIG2_RESULT_FIELD_NUMBER: builtins.int
     type: global___BTCSignNextResponse.Type.ValueType
     index: builtins.int
     """index of the current input or output"""
@@ -436,8 +446,11 @@ class BTCSignNextResponse(google.protobuf.message.Message):
     generated_output_pkscript: builtins.bytes
     """Generated output. The host *must* verify its correctness using `silent_payment_dleq_proof`."""
     silent_payment_dleq_proof: builtins.bytes
+    musig2_session_id: builtins.bytes
     @property
     def anti_klepto_signer_commitment(self) -> antiklepto_pb2.AntiKleptoSignerCommitment: ...
+    @property
+    def musig2_result(self) -> global___BTCMuSig2Result: ...
     def __init__(
         self,
         *,
@@ -449,9 +462,11 @@ class BTCSignNextResponse(google.protobuf.message.Message):
         anti_klepto_signer_commitment: antiklepto_pb2.AntiKleptoSignerCommitment | None = ...,
         generated_output_pkscript: builtins.bytes = ...,
         silent_payment_dleq_proof: builtins.bytes = ...,
+        musig2_session_id: builtins.bytes = ...,
+        musig2_result: global___BTCMuSig2Result | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "generated_output_pkscript", b"generated_output_pkscript", "has_signature", b"has_signature", "index", b"index", "prev_index", b"prev_index", "signature", b"signature", "silent_payment_dleq_proof", b"silent_payment_dleq_proof", "type", b"type"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "musig2_result", b"musig2_result"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "generated_output_pkscript", b"generated_output_pkscript", "has_signature", b"has_signature", "index", b"index", "musig2_result", b"musig2_result", "musig2_session_id", b"musig2_session_id", "prev_index", b"prev_index", "signature", b"signature", "silent_payment_dleq_proof", b"silent_payment_dleq_proof", "type", b"type"]) -> None: ...
 
 global___BTCSignNextResponse = BTCSignNextResponse
 
@@ -466,6 +481,7 @@ class BTCSignInputRequest(google.protobuf.message.Message):
     KEYPATH_FIELD_NUMBER: builtins.int
     SCRIPT_CONFIG_INDEX_FIELD_NUMBER: builtins.int
     HOST_NONCE_COMMITMENT_FIELD_NUMBER: builtins.int
+    MUSIG2_FIELD_NUMBER: builtins.int
     prevOutHash: builtins.bytes
     prevOutIndex: builtins.int
     prevOutValue: builtins.int
@@ -483,6 +499,8 @@ class BTCSignInputRequest(google.protobuf.message.Message):
         This differs from plain RFC6979 and does not provide anti-klepto protection.
         """
 
+    @property
+    def musig2(self) -> global___BTCMuSig2Input: ...
     def __init__(
         self,
         *,
@@ -493,11 +511,179 @@ class BTCSignInputRequest(google.protobuf.message.Message):
         keypath: collections.abc.Iterable[builtins.int] | None = ...,
         script_config_index: builtins.int = ...,
         host_nonce_commitment: antiklepto_pb2.AntiKleptoHostNonceCommitment | None = ...,
+        musig2: global___BTCMuSig2Input | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment", "keypath", b"keypath", "prevOutHash", b"prevOutHash", "prevOutIndex", b"prevOutIndex", "prevOutValue", b"prevOutValue", "script_config_index", b"script_config_index", "sequence", b"sequence"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment", "musig2", b"musig2"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment", "keypath", b"keypath", "musig2", b"musig2", "prevOutHash", b"prevOutHash", "prevOutIndex", b"prevOutIndex", "prevOutValue", b"prevOutValue", "script_config_index", b"script_config_index", "sequence", b"sequence"]) -> None: ...
 
 global___BTCSignInputRequest = BTCSignInputRequest
+
+@typing.final
+class BTCMuSig2Init(google.protobuf.message.Message):
+    """Secret nonces remain in volatile device memory between these rounds.
+    Cancel, lock, disconnect or a new Noise session requires fresh nonces.
+    """
+
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    class _Phase:
+        ValueType = typing.NewType("ValueType", builtins.int)
+        V: typing_extensions.TypeAlias = ValueType
+
+    class _PhaseEnumTypeWrapper(google.protobuf.internal.enum_type_wrapper._EnumTypeWrapper[BTCMuSig2Init._Phase.ValueType], builtins.type):
+        DESCRIPTOR: google.protobuf.descriptor.EnumDescriptor
+        NONCE: BTCMuSig2Init._Phase.ValueType  # 0
+        SIGN: BTCMuSig2Init._Phase.ValueType  # 1
+        ABORT: BTCMuSig2Init._Phase.ValueType  # 2
+
+    class Phase(_Phase, metaclass=_PhaseEnumTypeWrapper): ...
+    NONCE: BTCMuSig2Init.Phase.ValueType  # 0
+    SIGN: BTCMuSig2Init.Phase.ValueType  # 1
+    ABORT: BTCMuSig2Init.Phase.ValueType  # 2
+
+    PHASE_FIELD_NUMBER: builtins.int
+    SESSION_ID_FIELD_NUMBER: builtins.int
+    phase: global___BTCMuSig2Init.Phase.ValueType
+    session_id: builtins.bytes
+    """Empty for NONCE. The device-generated 32-byte handle for SIGN/ABORT.
+    This is host coordination state, not a standardized PSBT field.
+    """
+    def __init__(
+        self,
+        *,
+        phase: global___BTCMuSig2Init.Phase.ValueType = ...,
+        session_id: builtins.bytes = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["phase", b"phase", "session_id", b"session_id"]) -> None: ...
+
+global___BTCMuSig2Init = BTCMuSig2Init
+
+@typing.final
+class BTCMuSig2Input(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    KEY_EXPRESSION_FIELD_NUMBER: builtins.int
+    AGGREGATE_KEY_FIELD_NUMBER: builtins.int
+    PARTICIPANT_PUBKEYS_FIELD_NUMBER: builtins.int
+    CONTEXT_KEY_FIELD_NUMBER: builtins.int
+    TAPLEAF_HASH_FIELD_NUMBER: builtins.int
+    key_expression: builtins.str
+    """Exact BIP388 key expression from the registered policy, e.g. musig(@0,@1)/**.
+    BTCSignInputRequest.keypath is an address selector: participant origin path
+    followed by aggregate branch/index. Only the origin derives the private key.
+    """
+    aggregate_key: builtins.bytes
+    """PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: bare KeyAgg key and ordered keys."""
+    context_key: builtins.bytes
+    """Aggregate key in the BIP373 nonce/signature key-data tuple. It may be the
+    bare aggregate, its derived internal key, or its tweaked output key; the
+    device verifies the relationship to the registered policy.
+    """
+    tapleaf_hash: builtins.bytes
+    """Omitted for key-path signing; exactly 32 bytes for a policy tapscript leaf."""
+    @property
+    def participant_pubkeys(self) -> google.protobuf.internal.containers.RepeatedScalarFieldContainer[builtins.bytes]: ...
+    def __init__(
+        self,
+        *,
+        key_expression: builtins.str = ...,
+        aggregate_key: builtins.bytes = ...,
+        participant_pubkeys: collections.abc.Iterable[builtins.bytes] | None = ...,
+        context_key: builtins.bytes = ...,
+        tapleaf_hash: builtins.bytes | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "aggregate_key", b"aggregate_key", "context_key", b"context_key", "key_expression", b"key_expression", "participant_pubkeys", b"participant_pubkeys", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
+    def WhichOneof(self, oneof_group: typing.Literal["_tapleaf_hash", b"_tapleaf_hash"]) -> typing.Literal["tapleaf_hash"] | None: ...
+
+global___BTCMuSig2Input = BTCMuSig2Input
+
+@typing.final
+class BTCMuSig2Nonce(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    PARTICIPANT_PUBKEY_FIELD_NUMBER: builtins.int
+    PUBLIC_NONCE_FIELD_NUMBER: builtins.int
+    participant_pubkey: builtins.bytes
+    """compressed, 33 bytes"""
+    public_nonce: builtins.bytes
+    """two compressed points, 66 bytes"""
+    def __init__(
+        self,
+        *,
+        participant_pubkey: builtins.bytes = ...,
+        public_nonce: builtins.bytes = ...,
+    ) -> None: ...
+    def ClearField(self, field_name: typing.Literal["participant_pubkey", b"participant_pubkey", "public_nonce", b"public_nonce"]) -> None: ...
+
+global___BTCMuSig2Nonce = BTCMuSig2Nonce
+
+@typing.final
+class BTCMuSig2NoncesRequest(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    INPUT_INDEX_FIELD_NUMBER: builtins.int
+    CONTEXT_KEY_FIELD_NUMBER: builtins.int
+    TAPLEAF_HASH_FIELD_NUMBER: builtins.int
+    NONCES_FIELD_NUMBER: builtins.int
+    input_index: builtins.int
+    context_key: builtins.bytes
+    tapleaf_hash: builtins.bytes
+    @property
+    def nonces(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[global___BTCMuSig2Nonce]:
+        """Exactly one record per participant, in arbitrary map order, including ours."""
+
+    def __init__(
+        self,
+        *,
+        input_index: builtins.int = ...,
+        context_key: builtins.bytes = ...,
+        tapleaf_hash: builtins.bytes | None = ...,
+        nonces: collections.abc.Iterable[global___BTCMuSig2Nonce] | None = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "nonces", b"nonces", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
+    def WhichOneof(self, oneof_group: typing.Literal["_tapleaf_hash", b"_tapleaf_hash"]) -> typing.Literal["tapleaf_hash"] | None: ...
+
+global___BTCMuSig2NoncesRequest = BTCMuSig2NoncesRequest
+
+@typing.final
+class BTCMuSig2Result(google.protobuf.message.Message):
+    DESCRIPTOR: google.protobuf.descriptor.Descriptor
+
+    INPUT_INDEX_FIELD_NUMBER: builtins.int
+    PARTICIPANT_PUBKEY_FIELD_NUMBER: builtins.int
+    CONTEXT_KEY_FIELD_NUMBER: builtins.int
+    TAPLEAF_HASH_FIELD_NUMBER: builtins.int
+    PUBLIC_NONCE_FIELD_NUMBER: builtins.int
+    PARTIAL_SIGNATURE_FIELD_NUMBER: builtins.int
+    input_index: builtins.int
+    """Identifies this result, independently of the next requested input index."""
+    participant_pubkey: builtins.bytes
+    context_key: builtins.bytes
+    tapleaf_hash: builtins.bytes
+    public_nonce: builtins.bytes
+    """PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes"""
+    partial_signature: builtins.bytes
+    """PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes"""
+    def __init__(
+        self,
+        *,
+        input_index: builtins.int = ...,
+        participant_pubkey: builtins.bytes = ...,
+        context_key: builtins.bytes = ...,
+        tapleaf_hash: builtins.bytes | None = ...,
+        public_nonce: builtins.bytes = ...,
+        partial_signature: builtins.bytes = ...,
+    ) -> None: ...
+    def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "partial_signature", b"partial_signature", "public_nonce", b"public_nonce", "result", b"result", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "partial_signature", b"partial_signature", "participant_pubkey", b"participant_pubkey", "public_nonce", b"public_nonce", "result", b"result", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal["_tapleaf_hash", b"_tapleaf_hash"]) -> typing.Literal["tapleaf_hash"] | None: ...
+    @typing.overload
+    def WhichOneof(self, oneof_group: typing.Literal["result", b"result"]) -> typing.Literal["public_nonce", "partial_signature"] | None: ...
+
+global___BTCMuSig2Result = BTCMuSig2Result
 
 @typing.final
 class BTCSignOutputRequest(google.protobuf.message.Message):
@@ -943,6 +1129,7 @@ class BTCRequest(google.protobuf.message.Message):
     ANTIKLEPTO_SIGNATURE_FIELD_NUMBER: builtins.int
     PAYMENT_REQUEST_FIELD_NUMBER: builtins.int
     XPUBS_FIELD_NUMBER: builtins.int
+    MUSIG2_NONCES_FIELD_NUMBER: builtins.int
     @property
     def is_script_config_registered(self) -> global___BTCIsScriptConfigRegisteredRequest: ...
     @property
@@ -961,6 +1148,8 @@ class BTCRequest(google.protobuf.message.Message):
     def payment_request(self) -> global___BTCPaymentRequestRequest: ...
     @property
     def xpubs(self) -> global___BTCXpubsRequest: ...
+    @property
+    def musig2_nonces(self) -> global___BTCMuSig2NoncesRequest: ...
     def __init__(
         self,
         *,
@@ -973,10 +1162,11 @@ class BTCRequest(google.protobuf.message.Message):
         antiklepto_signature: antiklepto_pb2.AntiKleptoSignatureRequest | None = ...,
         payment_request: global___BTCPaymentRequestRequest | None = ...,
         xpubs: global___BTCXpubsRequest | None = ...,
+        musig2_nonces: global___BTCMuSig2NoncesRequest | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["antiklepto_signature", b"antiklepto_signature", "is_script_config_registered", b"is_script_config_registered", "payment_request", b"payment_request", "prevtx_init", b"prevtx_init", "prevtx_input", b"prevtx_input", "prevtx_output", b"prevtx_output", "register_script_config", b"register_script_config", "request", b"request", "sign_message", b"sign_message", "xpubs", b"xpubs"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["antiklepto_signature", b"antiklepto_signature", "is_script_config_registered", b"is_script_config_registered", "payment_request", b"payment_request", "prevtx_init", b"prevtx_init", "prevtx_input", b"prevtx_input", "prevtx_output", b"prevtx_output", "register_script_config", b"register_script_config", "request", b"request", "sign_message", b"sign_message", "xpubs", b"xpubs"]) -> None: ...
-    def WhichOneof(self, oneof_group: typing.Literal["request", b"request"]) -> typing.Literal["is_script_config_registered", "register_script_config", "prevtx_init", "prevtx_input", "prevtx_output", "sign_message", "antiklepto_signature", "payment_request", "xpubs"] | None: ...
+    def HasField(self, field_name: typing.Literal["antiklepto_signature", b"antiklepto_signature", "is_script_config_registered", b"is_script_config_registered", "musig2_nonces", b"musig2_nonces", "payment_request", b"payment_request", "prevtx_init", b"prevtx_init", "prevtx_input", b"prevtx_input", "prevtx_output", b"prevtx_output", "register_script_config", b"register_script_config", "request", b"request", "sign_message", b"sign_message", "xpubs", b"xpubs"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["antiklepto_signature", b"antiklepto_signature", "is_script_config_registered", b"is_script_config_registered", "musig2_nonces", b"musig2_nonces", "payment_request", b"payment_request", "prevtx_init", b"prevtx_init", "prevtx_input", b"prevtx_input", "prevtx_output", b"prevtx_output", "register_script_config", b"register_script_config", "request", b"request", "sign_message", b"sign_message", "xpubs", b"xpubs"]) -> None: ...
+    def WhichOneof(self, oneof_group: typing.Literal["request", b"request"]) -> typing.Literal["is_script_config_registered", "register_script_config", "prevtx_init", "prevtx_input", "prevtx_output", "sign_message", "antiklepto_signature", "payment_request", "xpubs", "musig2_nonces"] | None: ...
 
 global___BTCRequest = BTCRequest
 

@@ -70,6 +70,9 @@ def is_taproot(script_config: btc.BTCScriptConfigWithKeypath) -> bool:
     return (
         script_config.script_config.WhichOneof("config") == "simple_type"
         and script_config.script_config.simple_type == btc.BTCScriptConfig.P2TR
+    ) or (
+        script_config.script_config.WhichOneof("config") == "policy"
+        and script_config.script_config.policy.policy.startswith("tr(")
     )
 
 
@@ -109,6 +112,55 @@ class BTCInputType(TypedDict):
     script_config_index: int
     # Must be the transaction referenced by prev_out_hash. Can be None if `btc_sign_needs_prevtxs()` returns False.
     prev_tx: Optional[BTCPrevTxType]
+
+
+class BTCMuSig2Session:
+    """Public state for two calls to btc_sign(). No secret nonces leave firmware.
+
+    ``inputs`` maps transaction indexes to decoded BIP373/policy contexts. After
+    the nonce round, copy ``results`` into PSBT public-nonce fields, collect all
+    participants' nonces and call begin_sign(). Submit the identical transaction
+    again to obtain partial signatures in ``results``. The coordinator verifies
+    and combines these signatures. A device reset/disconnect requires a new round.
+    """
+
+    def __init__(self, inputs: Dict[int, btc.BTCMuSig2Input]):
+        if not inputs:
+            raise ValueError("MuSig2 inputs are required")
+        self.inputs = inputs
+        self.phase = btc.BTCMuSig2Init.NONCE
+        self.session_id = b""
+        self.nonces: Dict[int, btc.BTCMuSig2NoncesRequest] = {}
+        self.results: Dict[int, btc.BTCMuSig2Result] = {}
+
+    def begin_sign(self, nonces: Dict[int, btc.BTCMuSig2NoncesRequest]) -> None:
+        """Select signing after collecting every participant's BIP373 nonce."""
+        if len(self.session_id) != 32 or set(self.results) != set(self.inputs):
+            raise ValueError("Complete the nonce round first")
+        if self.phase != btc.BTCMuSig2Init.NONCE or set(nonces) != set(self.inputs):
+            raise ValueError("Invalid MuSig2 nonce set or phase")
+        self.phase = btc.BTCMuSig2Init.SIGN
+        self.nonces = nonces
+        self.results = {}
+
+    def collect(self, result: btc.BTCMuSig2Result) -> None:
+        """Check response routing before exposing a contribution to the PSBT."""
+        index = result.input_index
+        if index not in self.inputs or index in self.results:
+            raise ValueError("Unexpected or duplicate MuSig2 result")
+        context = self.inputs[index]
+        kind = "public_nonce" if self.phase == btc.BTCMuSig2Init.NONCE else "partial_signature"
+        size = 66 if self.phase == btc.BTCMuSig2Init.NONCE else 32
+        if (
+            result.context_key != context.context_key
+            or result.HasField("tapleaf_hash") != context.HasField("tapleaf_hash")
+            or result.tapleaf_hash != context.tapleaf_hash
+            or result.participant_pubkey not in context.participant_pubkeys
+            or result.WhichOneof("result") != kind
+            or len(getattr(result, kind)) != size
+        ):
+            raise ValueError("MuSig2 result does not match its PSBT context")
+        self.results[index] = result
 
 
 class BTCOutputInternal:
@@ -453,6 +505,7 @@ class BitBox02(BitBoxCommonAPI):
         format_unit: "btc.BTCSignInitRequest.FormatUnit.V" = btc.BTCSignInitRequest.FormatUnit.DEFAULT,
         output_script_configs: Optional[Sequence[btc.BTCScriptConfigWithKeypath]] = None,
         bip322_message: Optional[bytes] = None,
+        musig2: Optional[BTCMuSig2Session] = None,
     ) -> Sequence[Tuple[int, bytes]]:
         """
         coin: the first element of all provided keypaths must match the coin:
@@ -477,6 +530,8 @@ class BitBox02(BitBoxCommonAPI):
           inputs/outputs must match the BIP-322 to_sign virtual transaction (first input spends
           to_spend, single OP_RETURN output). Carries the message from PSBT global field
           PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE (0x09).
+        musig2: optional two-round session. Contributions are stored in its results;
+          the return value contains only ordinary signatures (none in the nonce round).
         Returns: list of (input index, signature) tuples.
         Raises Bitbox02Exception with ERR_USER_ABORT on user abort.
         """
@@ -509,6 +564,12 @@ class BitBox02(BitBoxCommonAPI):
             # OP_RETURN supported sice v9.24.0
             self._require_atleast(semver.VersionInfo(9, 24, 0))
 
+        if musig2 is not None:
+            if bip322_message is not None or musig2.results:
+                raise ValueError("Invalid or already completed MuSig2 round")
+            if any(index < 0 or index >= len(inputs) for index in musig2.inputs):
+                raise ValueError("MuSig2 input index out of range")
+        nonce_round = musig2 is not None and musig2.phase == btc.BTCMuSig2Init.NONCE
         sigs: List[Tuple[int, bytes]] = []
 
         # Init request
@@ -524,12 +585,29 @@ class BitBox02(BitBoxCommonAPI):
                 format_unit=format_unit,
                 output_script_configs=output_script_configs,
                 bip322_message=bip322_message,
+                musig2=(
+                    btc.BTCMuSig2Init(phase=musig2.phase, session_id=musig2.session_id)
+                    if musig2 is not None
+                    else None
+                ),
             )
         )
         next_response = self._msg_query(request, expected_response="btc_sign_next").btc_sign_next
 
+        if musig2 is not None:
+            # An older firmware ignores unknown protobuf fields. Require explicit
+            # acknowledgement before sending any transaction inputs to it.
+            token = next_response.musig2_session_id
+            if len(token) != 32 or (not nonce_round and token != musig2.session_id):
+                raise ValueError("Firmware did not acknowledge the MuSig2 session")
+            musig2.session_id = token
+
         is_inputs_pass2 = False
         while True:
+            if next_response.HasField("musig2_result"):
+                if musig2 is None:
+                    raise ValueError("Unexpected MuSig2 contribution")
+                musig2.collect(next_response.musig2_result)
             if next_response.type == btc.BTCSignNextResponse.INPUT:
                 input_index = next_response.index
                 tx_input = inputs[input_index]
@@ -543,12 +621,15 @@ class BitBox02(BitBoxCommonAPI):
                         sequence=tx_input["sequence"],
                         keypath=tx_input["keypath"],
                         script_config_index=tx_input["script_config_index"],
+                        musig2=musig2.inputs.get(input_index) if musig2 is not None else None,
                     )
                 )
 
                 # Anti-Klepto protocol not supported yet for Schnorr signatures.
                 input_is_schnorr = is_taproot(script_configs[tx_input["script_config_index"]])
-                perform_antiklepto = is_inputs_pass2 and not input_is_schnorr
+                perform_antiklepto = (
+                    is_inputs_pass2 and not input_is_schnorr and not nonce_round
+                )
 
                 if perform_antiklepto:
                     host_nonce = os.urandom(32)
@@ -584,7 +665,11 @@ class BitBox02(BitBoxCommonAPI):
                     if self.debug:
                         print(f"Antiklepto nonce verification PASSED for input {input_index}")
 
-                if is_inputs_pass2:
+                if (
+                    is_inputs_pass2
+                    and not nonce_round
+                    and (musig2 is None or input_index not in musig2.inputs)
+                ):
                     assert next_response.has_signature
                     sigs.append((input_index, next_response.signature))
 
@@ -665,11 +750,34 @@ class BitBox02(BitBoxCommonAPI):
                 next_response = self._msg_query(
                     request, expected_response="btc_sign_next"
                 ).btc_sign_next
+            elif next_response.type == btc.BTCSignNextResponse.MUSIG2_NONCES:
+                if musig2 is None or nonce_round:
+                    raise ValueError("Unexpected MuSig2 nonce request")
+                btc_request = btc.BTCRequest()
+                btc_request.musig2_nonces.CopyFrom(musig2.nonces[next_response.index])
+                next_response = self._btc_msg_query(
+                    btc_request, expected_response="sign_next"
+                ).sign_next
             elif next_response.type == btc.BTCSignNextResponse.DONE:
+                if musig2 is not None and (
+                    set(musig2.results) != set(musig2.inputs)
+                    or next_response.musig2_session_id != musig2.session_id
+                ):
+                    raise ValueError("Incomplete MuSig2 round")
                 break
             else:
                 raise Exception("unexpected response")
         return sigs
+
+    def btc_musig2_abort(self, session_id: bytes) -> None:
+        """Discard pending firmware nonces before starting a replacement session."""
+        request = hww.Request()
+        request.btc_sign_init.musig2.CopyFrom(
+            btc.BTCMuSig2Init(phase=btc.BTCMuSig2Init.ABORT, session_id=session_id)
+        )
+        response = self._msg_query(request, expected_response="btc_sign_next").btc_sign_next
+        if response.type != btc.BTCSignNextResponse.DONE:
+            raise ValueError("Unexpected MuSig2 abort response")
 
     def btc_sign_msg(
         self, coin: "btc.BTCCoin.V", script_config: btc.BTCScriptConfigWithKeypath, msg: bytes
