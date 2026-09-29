@@ -535,18 +535,29 @@ class BTCMuSig2Init(google.protobuf.message.Message):
         NONCE: BTCMuSig2Init._Phase.ValueType  # 0
         SIGN: BTCMuSig2Init._Phase.ValueType  # 1
         ABORT: BTCMuSig2Init._Phase.ValueType  # 2
+        NONCE_AND_SIGN: BTCMuSig2Init._Phase.ValueType  # 3
+        """Single round for the last participant to contribute a nonce: the host
+        supplies every other participant's public nonce, the device generates
+        its own nonce and signs immediately. No secret nonce is retained.
+        """
 
     class Phase(_Phase, metaclass=_PhaseEnumTypeWrapper): ...
     NONCE: BTCMuSig2Init.Phase.ValueType  # 0
     SIGN: BTCMuSig2Init.Phase.ValueType  # 1
     ABORT: BTCMuSig2Init.Phase.ValueType  # 2
+    NONCE_AND_SIGN: BTCMuSig2Init.Phase.ValueType  # 3
+    """Single round for the last participant to contribute a nonce: the host
+    supplies every other participant's public nonce, the device generates
+    its own nonce and signs immediately. No secret nonce is retained.
+    """
 
     PHASE_FIELD_NUMBER: builtins.int
     SESSION_ID_FIELD_NUMBER: builtins.int
     phase: global___BTCMuSig2Init.Phase.ValueType
     session_id: builtins.bytes
-    """Empty for NONCE. The device-generated 32-byte handle for SIGN/ABORT.
-    This is host coordination state, not a standardized PSBT field.
+    """Empty for NONCE and NONCE_AND_SIGN. The device-generated 32-byte handle
+    for SIGN/ABORT. This is host coordination state, not a standardized PSBT
+    field.
     """
     def __init__(
         self,
@@ -631,7 +642,9 @@ class BTCMuSig2NoncesRequest(google.protobuf.message.Message):
     tapleaf_hash: builtins.bytes
     @property
     def nonces(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[global___BTCMuSig2Nonce]:
-        """Exactly one record per participant, in arbitrary map order, including ours."""
+        """Exactly one record per participant, in arbitrary map order. SIGN includes
+        ours; NONCE_AND_SIGN includes every participant except us.
+        """
 
     def __init__(
         self,
@@ -663,7 +676,8 @@ class BTCMuSig2Result(google.protobuf.message.Message):
     context_key: builtins.bytes
     tapleaf_hash: builtins.bytes
     public_nonce: builtins.bytes
-    """NONCE sets only the public nonce, SIGN only the partial signature.
+    """NONCE sets only the public nonce, SIGN only the partial signature and
+    NONCE_AND_SIGN both.
     PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
     """
     partial_signature: builtins.bytes

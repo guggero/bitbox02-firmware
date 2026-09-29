@@ -176,10 +176,15 @@ message BTCMuSig2Init {
     NONCE = 0;
     SIGN = 1;
     ABORT = 2;
+    // Single round for the last participant to contribute a nonce: the host
+    // supplies every other participant's public nonce, the device generates
+    // its own nonce and signs immediately. No secret nonce is retained.
+    NONCE_AND_SIGN = 3;
   }
   Phase phase = 1;
-  // Empty for NONCE. The device-generated 32-byte handle for SIGN/ABORT.
-  // This is host coordination state, not a standardized PSBT field.
+  // Empty for NONCE and NONCE_AND_SIGN. The device-generated 32-byte handle
+  // for SIGN/ABORT. This is host coordination state, not a standardized PSBT
+  // field.
   bytes session_id = 2;
 }
 
@@ -208,7 +213,8 @@ message BTCMuSig2NoncesRequest {
   uint32 input_index = 1;
   bytes context_key = 2;
   optional bytes tapleaf_hash = 3;
-  // Exactly one record per participant, in arbitrary map order, including ours.
+  // Exactly one record per participant, in arbitrary map order. SIGN includes
+  // ours; NONCE_AND_SIGN includes every participant except us.
   repeated BTCMuSig2Nonce nonces = 4;
 }
 
@@ -218,7 +224,8 @@ message BTCMuSig2Result {
   bytes participant_pubkey = 2;
   bytes context_key = 3;
   optional bytes tapleaf_hash = 4;
-  // NONCE sets only the public nonce, SIGN only the partial signature.
+  // NONCE sets only the public nonce, SIGN only the partial signature and
+  // NONCE_AND_SIGN both.
   bytes public_nonce = 5; // PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
   bytes partial_signature = 6; // PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
 }

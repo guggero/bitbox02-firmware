@@ -47,14 +47,28 @@ pub fn abort(id: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
+/// What a round contributes to each MuSig input.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// Generate and retain a secret nonce, return the public nonce.
+    Nonce,
+    /// Consume a retained secret nonce, return a partial signature.
+    Sign,
+    /// Last participant to contribute a nonce: generate a nonce once all other
+    /// participants' nonces are known and sign with it right away. Nothing is
+    /// retained, so the round neither needs nor touches pending storage.
+    NonceAndSign,
+}
+
 /// An active invocation owns all its secrets. Dropping its future on cancellation
 /// erases them. Only a successful nonce round returns them to pending storage.
 pub struct Round {
     pending: Pending,
-    pub generate: bool,
+    pub mode: Mode,
     hasher: Sha256,
     inputs: Vec<[u8; 32]>,
     num_nonces: usize,
+    num_signed: usize,
     approved: bool,
 }
 
@@ -90,15 +104,22 @@ impl Round {
         let Some(init) = &request.musig2 else {
             return Ok(None);
         };
-        let generate = match Phase::try_from(init.phase)? {
-            Phase::Nonce if init.session_id.is_empty() => true,
-            Phase::Sign if init.session_id.len() == 32 => false,
+        let mode = match Phase::try_from(init.phase)? {
+            Phase::Nonce if init.session_id.is_empty() => Mode::Nonce,
+            Phase::Sign if init.session_id.len() == 32 => Mode::Sign,
+            Phase::NonceAndSign if init.session_id.is_empty() => Mode::NonceAndSign,
             _ => return Err(Error::InvalidInput),
         };
-        let pending = if generate {
-            if PENDING.0.borrow().is_some() {
+        if mode == Mode::Nonce && PENDING.0.borrow().is_some() {
+            return Err(Error::InvalidState);
+        }
+        let pending = if mode == Mode::Sign {
+            let pending = PENDING.0.borrow_mut().take().ok_or(Error::InvalidState)?;
+            if init.session_id != pending.id {
                 return Err(Error::InvalidState);
             }
+            pending
+        } else {
             Pending {
                 id: **bitbox_core_utils::random::random_32_bytes_from_hal(hal)
                     .await
@@ -106,12 +127,6 @@ impl Round {
                 transaction: [0; 32],
                 slots: Vec::new(),
             }
-        } else {
-            let pending = PENDING.0.borrow_mut().take().ok_or(Error::InvalidState)?;
-            if init.session_id != pending.id {
-                return Err(Error::InvalidState);
-            }
-            pending
         };
         if request.num_inputs == 0
             || request.num_inputs as usize > MAX_INPUTS
@@ -127,10 +142,11 @@ impl Round {
         hash_message(&mut hasher, &normalized);
         Ok(Some(Self {
             pending,
-            generate,
+            mode,
             hasher,
             inputs: Vec::new(),
             num_nonces: 0,
+            num_signed: 0,
             approved: false,
         }))
     }
@@ -163,7 +179,7 @@ impl Round {
             return Err(Error::InvalidInput);
         }
         let transaction: [u8; 32] = self.hasher.clone().finalize().into();
-        if self.generate {
+        if self.mode != Mode::Sign {
             self.pending.transaction = transaction;
         } else if self.pending.transaction != transaction
             || self.pending.slots.len() != self.num_nonces
@@ -191,26 +207,70 @@ impl Round {
         message: &[u8; 32],
     ) -> Result<[u8; 66], Error> {
         if !self.approved
-            || !self.generate
+            || self.mode != Mode::Nonce
             || self.pending.slots.len() >= MAX_NONCES
             || self.pending.slots.iter().any(|slot| slot.index == index)
         {
             return Err(Error::InvalidState);
         }
+        let nonce = self.generate_nonce(hal, context, message).await?;
+        let public = nonce.public_nonce();
+        self.pending.slots.push(Slot { index, nonce });
+        Ok(public)
+    }
+
+    /// Generate a secret nonce from fresh device randomness, bound to our key,
+    /// the aggregate, the message and the reviewed transaction.
+    async fn generate_nonce(
+        &self,
+        hal: &mut impl crate::hal::Hal,
+        context: &SigningContext,
+        message: &[u8; 32],
+    ) -> Result<SecretNonce, Error> {
         let secret = crate::keystore::secp256k1_get_private_key(hal, &context.keypath).await?;
         let random = bitbox_core_utils::random::random_32_bytes_from_hal(hal)
             .await
             .map_err(|_| Error::Generic)?;
-        let nonce = SecretNonce::generate(
+        Ok(SecretNonce::generate(
             &random,
             secret.as_slice().try_into().map_err(|_| Error::Generic)?,
             &context.aggregate,
             message,
             &self.pending.transaction,
-        )?;
+        )?)
+    }
+
+    /// Contribute as the last participant: every other participant's public
+    /// nonce is already fixed in `request`, so a fresh nonce can be generated and
+    /// consumed immediately. The secret nonce never outlives this call.
+    pub async fn nonce_and_sign(
+        &mut self,
+        hal: &mut impl crate::hal::Hal,
+        index: u32,
+        metadata: &pb::BtcMuSig2Input,
+        context: &SigningContext,
+        message: &[u8; 32],
+        request: &pb::BtcMuSig2NoncesRequest,
+    ) -> Result<([u8; 66], [u8; 32]), Error> {
+        if !self.approved || self.mode != Mode::NonceAndSign || self.num_signed >= self.num_nonces {
+            return Err(Error::InvalidState);
+        }
+        // Count the attempt before anything can fail, so an input cannot be
+        // retried within the same round.
+        self.num_signed += 1;
+        let nonce = self.generate_nonce(hal, context, message).await?;
         let public = nonce.public_nonce();
-        self.pending.slots.push(Slot { index, nonce });
-        Ok(public)
+        let nonces = order_nonces(index, metadata, context, request, Some(&public))?;
+        let secret = crate::keystore::secp256k1_get_private_key(hal, &context.keypath).await?;
+        let signature = nonce
+            .sign(
+                secret.as_slice().try_into().map_err(|_| Error::Generic)?,
+                &context.aggregate,
+                &nonces,
+                message,
+            )
+            .map_err(|_| Error::InvalidInput)?;
+        Ok((public, signature))
     }
 
     /// Remove a nonce before signing or accessing the keystore. Every error
@@ -223,7 +283,7 @@ impl Round {
         message: &[u8; 32],
         nonces: &[[u8; 66]],
     ) -> Result<[u8; 32], Error> {
-        if !self.approved || self.generate {
+        if !self.approved || self.mode != Mode::Sign {
             return Err(Error::InvalidState);
         }
         let position = self
@@ -251,13 +311,23 @@ impl Round {
         if !self.approved {
             return Err(Error::InvalidState);
         }
-        if self.generate {
-            if self.pending.slots.len() != self.num_nonces {
-                return Err(Error::InvalidState);
+        match self.mode {
+            Mode::Nonce => {
+                if self.pending.slots.len() != self.num_nonces {
+                    return Err(Error::InvalidState);
+                }
+                *PENDING.0.borrow_mut() = Some(self.pending);
             }
-            *PENDING.0.borrow_mut() = Some(self.pending);
-        } else if !self.pending.slots.is_empty() {
-            return Err(Error::InvalidState);
+            Mode::Sign => {
+                if !self.pending.slots.is_empty() {
+                    return Err(Error::InvalidState);
+                }
+            }
+            Mode::NonceAndSign => {
+                if self.num_signed != self.num_nonces {
+                    return Err(Error::InvalidState);
+                }
+            }
         }
         Ok(id)
     }
@@ -300,16 +370,22 @@ pub fn context(
 }
 
 /// Match the complete BIP373 context and order public nonces by participant.
+///
+/// Without `ours`, the request must contain every participant's nonce, including
+/// ours. With `ours`, the device's freshly generated nonce, the request must
+/// contain every other participant's nonce and must not contain ours.
 pub fn order_nonces(
     index: u32,
     metadata: &pb::BtcMuSig2Input,
     context: &SigningContext,
     request: &pb::BtcMuSig2NoncesRequest,
+    ours: Option<&[u8; 66]>,
 ) -> Result<Vec<[u8; 66]>, Error> {
+    let expected = context.participants.len() - usize::from(ours.is_some());
     if request.input_index != index
         || request.context_key != metadata.context_key
         || request.tapleaf_hash != metadata.tapleaf_hash
-        || request.nonces.len() != context.participants.len()
+        || request.nonces.len() != expected
     {
         return Err(Error::InvalidInput);
     }
@@ -317,6 +393,16 @@ pub fn order_nonces(
         .participants
         .iter()
         .map(|key| {
+            if let (Some(ours), true) = (ours, key == &context.participant) {
+                if request
+                    .nonces
+                    .iter()
+                    .any(|nonce| nonce.participant_pubkey.as_slice() == key)
+                {
+                    return Err(Error::InvalidInput);
+                }
+                return Ok(*ours);
+            }
             let mut matches = request
                 .nonces
                 .iter()
@@ -436,6 +522,85 @@ mod tests {
     }
 
     #[async_test::test]
+    async fn test_round_nonce_and_sign_once() {
+        let mut hal = TestingHal::new();
+        let (context, mut request, input) = fixture(&mut hal).await;
+        request.musig2 = Some(pb::BtcMuSig2Init {
+            phase: Phase::NonceAndSign as _,
+            session_id: vec![],
+        });
+        let metadata = pb::BtcMuSig2Input::default();
+        let other =
+            SecretNonce::generate(&[3; 32], &[2; 32], &context.aggregate, &[42; 32], &[4; 32])
+                .unwrap();
+        let nonces_request = pb::BtcMuSig2NoncesRequest {
+            nonces: vec![pb::BtcMuSig2Nonce {
+                participant_pubkey: context.participants[1].to_vec(),
+                public_nonce: other.public_nonce().to_vec(),
+            }],
+            ..Default::default()
+        };
+
+        let mut round = Round::begin(&mut hal, &request).await.unwrap().unwrap();
+        round.input(&input).unwrap();
+        round.output(&Default::default());
+        // Nothing may be contributed before the transaction is approved.
+        assert!(
+            round
+                .nonce_and_sign(&mut hal, 0, &metadata, &context, &[42; 32], &nonces_request)
+                .await
+                .is_err()
+        );
+        round.approve().unwrap();
+        // The two-round operations are not available in this mode.
+        assert!(round.nonce(&mut hal, 0, &context, &[42; 32]).await.is_err());
+        assert!(
+            round
+                .sign(&mut hal, 0, &context, &[42; 32], &[[0; 66]; 2])
+                .await
+                .is_err()
+        );
+        let (public, signature) = round
+            .nonce_and_sign(&mut hal, 0, &metadata, &context, &[42; 32], &nonces_request)
+            .await
+            .unwrap();
+        bitbox_secp256k1::musig::verify_partial(
+            &context.aggregate,
+            &[public, other.public_nonce()],
+            &[42; 32],
+            0,
+            &signature,
+        )
+        .unwrap();
+        // Each input contributes once per round.
+        assert!(
+            round
+                .nonce_and_sign(&mut hal, 0, &metadata, &context, &[42; 32], &nonces_request)
+                .await
+                .is_err()
+        );
+        round.finish().unwrap();
+        assert!(PENDING.0.borrow().is_none());
+
+        // A round that did not contribute to every MuSig input cannot finish.
+        let mut round = Round::begin(&mut hal, &request).await.unwrap().unwrap();
+        round.input(&input).unwrap();
+        round.output(&Default::default());
+        round.approve().unwrap();
+        assert!(round.finish().is_err());
+
+        // A pending nonce round is neither required nor consumed.
+        request.musig2.as_mut().unwrap().phase = Phase::Nonce as _;
+        let (id, _) = pending(&mut hal, &context, &request, &input).await;
+        request.musig2.as_mut().unwrap().phase = Phase::NonceAndSign as _;
+        assert!(Round::begin(&mut hal, &request).await.unwrap().is_some());
+        assert_eq!(PENDING.0.borrow().as_ref().unwrap().id, id);
+        request.musig2.as_mut().unwrap().session_id = id.to_vec();
+        assert!(Round::begin(&mut hal, &request).await.is_err());
+        clear();
+    }
+
+    #[async_test::test]
     async fn test_round_rejects_substitution_and_cleans_up() {
         let mut hal = TestingHal::new();
         let (context, request, input) = fixture(&mut hal).await;
@@ -541,7 +706,7 @@ mod tests {
                 })
                 .collect(),
         };
-        order_nonces(2, &metadata, &context, &request).unwrap();
+        order_nonces(2, &metadata, &context, &request, None).unwrap();
         for mutation in 0..7 {
             let mut request = request.clone();
             match mutation {
@@ -557,7 +722,20 @@ mod tests {
                     request.nonces[0].public_nonce.pop();
                 }
             }
-            assert!(order_nonces(2, &metadata, &context, &request).is_err());
+            assert!(order_nonces(2, &metadata, &context, &request, None).is_err());
         }
+        // With our nonce supplied by the device, the request must carry exactly
+        // the other participants' nonces.
+        let ours = [7; 66];
+        let mut others = request.clone();
+        others
+            .nonces
+            .retain(|nonce| nonce.participant_pubkey.as_slice() != context.participant);
+        let ordered = order_nonces(2, &metadata, &context, &others, Some(&ours)).unwrap();
+        assert_eq!(ordered[0], ours);
+        assert_eq!(ordered[1], [4; 66]);
+        assert!(order_nonces(2, &metadata, &context, &request, Some(&ours)).is_err());
+        others.nonces.clear();
+        assert!(order_nonces(2, &metadata, &context, &others, Some(&ours)).is_err());
     }
 }

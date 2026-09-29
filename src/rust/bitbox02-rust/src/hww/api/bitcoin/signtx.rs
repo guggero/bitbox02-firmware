@@ -1779,7 +1779,7 @@ async fn _process(
                 tapleaf_hash: metadata.tapleaf_hash.clone(),
                 ..Default::default()
             };
-            if round.generate {
+            if round.mode == musig2::Mode::Nonce {
                 result.public_nonce = round
                     .nonce(hal, input_index, &context, &sighash)
                     .await?
@@ -1800,14 +1800,26 @@ async fn _process(
                 else {
                     return Err(Error::InvalidState);
                 };
-                let nonces = musig2::order_nonces(input_index, metadata, &context, &request)?;
-                result.partial_signature = round
-                    .sign(hal, input_index, &context, &sighash, &nonces)
-                    .await?
-                    .to_vec();
+                if round.mode == musig2::Mode::Sign {
+                    let nonces =
+                        musig2::order_nonces(input_index, metadata, &context, &request, None)?;
+                    result.partial_signature = round
+                        .sign(hal, input_index, &context, &sighash, &nonces)
+                        .await?
+                        .to_vec();
+                } else {
+                    let (public_nonce, partial_signature) = round
+                        .nonce_and_sign(hal, input_index, metadata, &context, &sighash, &request)
+                        .await?;
+                    result.public_nonce = public_nonce.to_vec();
+                    result.partial_signature = partial_signature.to_vec();
+                }
             }
             next_response.next.musig2_result = Some(result);
-        } else if musig_round.as_ref().is_some_and(|round| round.generate) {
+        } else if musig_round
+            .as_ref()
+            .is_some_and(|round| round.mode == musig2::Mode::Nonce)
+        {
             // Nonce mode never emits ordinary signatures. They are produced after
             // transaction approval in the signing round alongside MuSig partials.
         } else {

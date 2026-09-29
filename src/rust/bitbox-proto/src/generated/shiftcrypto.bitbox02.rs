@@ -837,8 +837,9 @@ pub struct BtcSignInputRequest {
 pub struct BtcMuSig2Init {
     #[prost(enumeration = "btc_mu_sig2_init::Phase", tag = "1")]
     pub phase: i32,
-    /// Empty for NONCE. The device-generated 32-byte handle for SIGN/ABORT.
-    /// This is host coordination state, not a standardized PSBT field.
+    /// Empty for NONCE and NONCE_AND_SIGN. The device-generated 32-byte handle
+    /// for SIGN/ABORT. This is host coordination state, not a standardized PSBT
+    /// field.
     #[prost(bytes = "vec", tag = "2")]
     pub session_id: ::prost::alloc::vec::Vec<u8>,
 }
@@ -850,6 +851,10 @@ pub mod btc_mu_sig2_init {
         Nonce = 0,
         Sign = 1,
         Abort = 2,
+        /// Single round for the last participant to contribute a nonce: the host
+        /// supplies every other participant's public nonce, the device generates
+        /// its own nonce and signs immediately. No secret nonce is retained.
+        NonceAndSign = 3,
     }
     impl Phase {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -861,6 +866,7 @@ pub mod btc_mu_sig2_init {
                 Phase::Nonce => "NONCE",
                 Phase::Sign => "SIGN",
                 Phase::Abort => "ABORT",
+                Phase::NonceAndSign => "NONCE_AND_SIGN",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -869,6 +875,7 @@ pub mod btc_mu_sig2_init {
                 "NONCE" => Some(Self::Nonce),
                 "SIGN" => Some(Self::Sign),
                 "ABORT" => Some(Self::Abort),
+                "NONCE_AND_SIGN" => Some(Self::NonceAndSign),
                 _ => None,
             }
         }
@@ -915,7 +922,8 @@ pub struct BtcMuSig2NoncesRequest {
     pub context_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", optional, tag = "3")]
     pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    /// Exactly one record per participant, in arbitrary map order, including ours.
+    /// Exactly one record per participant, in arbitrary map order. SIGN includes
+    /// ours; NONCE_AND_SIGN includes every participant except us.
     #[prost(message, repeated, tag = "4")]
     pub nonces: ::prost::alloc::vec::Vec<BtcMuSig2Nonce>,
 }
@@ -931,7 +939,8 @@ pub struct BtcMuSig2Result {
     pub context_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", optional, tag = "4")]
     pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    /// NONCE sets only the public nonce, SIGN only the partial signature.
+    /// NONCE sets only the public nonce, SIGN only the partial signature and
+    /// NONCE_AND_SIGN both.
     ///
     /// PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
     #[prost(bytes = "vec", tag = "5")]
