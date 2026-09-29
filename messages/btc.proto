@@ -218,10 +218,9 @@ message BTCMuSig2Result {
   bytes participant_pubkey = 2;
   bytes context_key = 3;
   optional bytes tapleaf_hash = 4;
-  oneof result {
-    bytes public_nonce = 5; // PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
-    bytes partial_signature = 6; // PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
-  }
+  // NONCE sets only the public nonce, SIGN only the partial signature.
+  bytes public_nonce = 5; // PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
+  bytes partial_signature = 6; // PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
 }
 
 enum BTCOutputType {

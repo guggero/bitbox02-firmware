@@ -663,7 +663,9 @@ class BTCMuSig2Result(google.protobuf.message.Message):
     context_key: builtins.bytes
     tapleaf_hash: builtins.bytes
     public_nonce: builtins.bytes
-    """PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes"""
+    """NONCE sets only the public nonce, SIGN only the partial signature.
+    PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
+    """
     partial_signature: builtins.bytes
     """PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes"""
     def __init__(
@@ -676,12 +678,9 @@ class BTCMuSig2Result(google.protobuf.message.Message):
         public_nonce: builtins.bytes = ...,
         partial_signature: builtins.bytes = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "partial_signature", b"partial_signature", "public_nonce", b"public_nonce", "result", b"result", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "partial_signature", b"partial_signature", "participant_pubkey", b"participant_pubkey", "public_nonce", b"public_nonce", "result", b"result", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
-    @typing.overload
+    def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "partial_signature", b"partial_signature", "participant_pubkey", b"participant_pubkey", "public_nonce", b"public_nonce", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
     def WhichOneof(self, oneof_group: typing.Literal["_tapleaf_hash", b"_tapleaf_hash"]) -> typing.Literal["tapleaf_hash"] | None: ...
-    @typing.overload
-    def WhichOneof(self, oneof_group: typing.Literal["result", b"result"]) -> typing.Literal["public_nonce", "partial_signature"] | None: ...
 
 global___BTCMuSig2Result = BTCMuSig2Result
 

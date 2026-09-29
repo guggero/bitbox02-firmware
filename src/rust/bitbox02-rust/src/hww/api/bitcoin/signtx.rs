@@ -1772,13 +1772,18 @@ async fn _process(
                 input_index,
                 tapleaf_hash: context.tapleaf_hash,
             });
-            let result = if round.generate {
-                pb::btc_mu_sig2_result::Result::PublicNonce(
-                    round
-                        .nonce(hal, input_index, &context, &sighash)
-                        .await?
-                        .to_vec(),
-                )
+            let mut result = pb::BtcMuSig2Result {
+                input_index,
+                participant_pubkey: context.participant.to_vec(),
+                context_key: metadata.context_key.clone(),
+                tapleaf_hash: metadata.tapleaf_hash.clone(),
+                ..Default::default()
+            };
+            if round.generate {
+                result.public_nonce = round
+                    .nonce(hal, input_index, &context, &sighash)
+                    .await?
+                    .to_vec();
             } else {
                 // This is a BIP373 public-nonce exchange, independent of ECDSA anti-klepto.
                 let request = get_request(
@@ -1796,20 +1801,12 @@ async fn _process(
                     return Err(Error::InvalidState);
                 };
                 let nonces = musig2::order_nonces(input_index, metadata, &context, &request)?;
-                pb::btc_mu_sig2_result::Result::PartialSignature(
-                    round
-                        .sign(hal, input_index, &context, &sighash, &nonces)
-                        .await?
-                        .to_vec(),
-                )
-            };
-            next_response.next.musig2_result = Some(pb::BtcMuSig2Result {
-                input_index,
-                participant_pubkey: context.participant.to_vec(),
-                context_key: metadata.context_key.clone(),
-                tapleaf_hash: metadata.tapleaf_hash.clone(),
-                result: Some(result),
-            });
+                result.partial_signature = round
+                    .sign(hal, input_index, &context, &sighash, &nonces)
+                    .await?
+                    .to_vec();
+            }
+            next_response.next.musig2_result = Some(result);
         } else if musig_round.as_ref().is_some_and(|round| round.generate) {
             // Nonce mode never emits ordinary signatures. They are produced after
             // transaction approval in the signing round alongside MuSig partials.

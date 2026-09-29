@@ -149,15 +149,15 @@ class BTCMuSig2Session:
         if index not in self.inputs or index in self.results:
             raise ValueError("Unexpected or duplicate MuSig2 result")
         context = self.inputs[index]
-        kind = "public_nonce" if self.phase == btc.BTCMuSig2Init.NONCE else "partial_signature"
-        size = 66 if self.phase == btc.BTCMuSig2Init.NONCE else 32
+        nonce_size = 66 if self.phase == btc.BTCMuSig2Init.NONCE else 0
+        signature_size = 32 if self.phase == btc.BTCMuSig2Init.SIGN else 0
         if (
             result.context_key != context.context_key
             or result.HasField("tapleaf_hash") != context.HasField("tapleaf_hash")
             or result.tapleaf_hash != context.tapleaf_hash
             or result.participant_pubkey not in context.participant_pubkeys
-            or result.WhichOneof("result") != kind
-            or len(getattr(result, kind)) != size
+            or len(result.public_nonce) != nonce_size
+            or len(result.partial_signature) != signature_size
         ):
             raise ValueError("MuSig2 result does not match its PSBT context")
         self.results[index] = result

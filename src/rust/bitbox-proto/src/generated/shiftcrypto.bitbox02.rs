@@ -931,21 +931,14 @@ pub struct BtcMuSig2Result {
     pub context_key: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", optional, tag = "4")]
     pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    #[prost(oneof = "btc_mu_sig2_result::Result", tags = "5, 6")]
-    pub result: ::core::option::Option<btc_mu_sig2_result::Result>,
-}
-/// Nested message and enum types in `BTCMuSig2Result`.
-pub mod btc_mu_sig2_result {
-    #[allow(clippy::derive_partial_eq_without_eq)]
-    #[derive(Clone, PartialEq, ::prost::Oneof)]
-    pub enum Result {
-        /// PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
-        #[prost(bytes, tag = "5")]
-        PublicNonce(::prost::alloc::vec::Vec<u8>),
-        /// PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
-        #[prost(bytes, tag = "6")]
-        PartialSignature(::prost::alloc::vec::Vec<u8>),
-    }
+    /// NONCE sets only the public nonce, SIGN only the partial signature.
+    ///
+    /// PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
+    #[prost(bytes = "vec", tag = "5")]
+    pub public_nonce: ::prost::alloc::vec::Vec<u8>,
+    /// PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
+    #[prost(bytes = "vec", tag = "6")]
+    pub partial_signature: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

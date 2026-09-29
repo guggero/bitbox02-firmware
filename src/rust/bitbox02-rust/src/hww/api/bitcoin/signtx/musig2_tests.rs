@@ -12,7 +12,6 @@ use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
 use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
 use core::cell::RefCell;
 use pb::btc_mu_sig2_init::Phase;
-use pb::btc_mu_sig2_result::Result as Contribution;
 use util::bip32::HARDENED;
 
 struct Fixture {
@@ -286,9 +285,9 @@ async fn test_musig2_signtx() {
         for (i, result) in public.iter().enumerate() {
             let ctx = &fixture.contexts[i];
             assert_eq!(result.input_index, i as u32);
-            let Contribution::PublicNonce(ours) = result.result.as_ref().unwrap() else {
-                panic!()
-            };
+            let ours = &result.public_nonce;
+            assert_eq!(ours.len(), 66);
+            assert!(result.partial_signature.is_empty());
             let other = SecretNonce::generate(
                 &[20 + i as u8; 32],
                 &fixture.other_secret,
@@ -345,9 +344,8 @@ async fn test_musig2_signtx() {
         assert_eq!(partials.len(), 2);
         for i in 0..2 {
             let ctx = &fixture.contexts[i];
-            let Contribution::PartialSignature(sig) = partials[i].result.as_ref().unwrap() else {
-                panic!()
-            };
+            let sig = &partials[i].partial_signature;
+            assert!(partials[i].public_nonce.is_empty());
             assert_eq!(partials[i].input_index, i as u32);
             assert_eq!(partials[i].context_key, public[i].context_key);
             let signer = ctx
@@ -368,7 +366,7 @@ async fn test_musig2_signtx() {
         // No firmware or participant private key/nonce is included.
         if let Ok(directory) = std::env::var("BITBOX_MUSIG2_FIXTURES") {
             let records: Vec<_> = fixture.contexts.iter().enumerate().map(|(i, ctx)| {
-                let Contribution::PartialSignature(sig) = partials[i].result.as_ref().unwrap() else { panic!() };
+                let sig = &partials[i].partial_signature;
                 let signer = ctx.participants.iter().position(|key| key == &ctx.participant).unwrap();
                 let mut signatures = vec![hex::encode(peer_signatures[i]); 2];
                 signatures[signer] = hex::encode(sig);
