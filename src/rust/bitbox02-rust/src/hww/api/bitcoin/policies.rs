@@ -60,9 +60,9 @@ where
     Ok(())
 }
 
-// We only support Bitcoin for now.
+// We only support Bitcoin for now, including regtest.
 fn check_enabled(coin: BtcCoin) -> Result<(), Error> {
-    if !matches!(coin, BtcCoin::Btc | BtcCoin::Tbtc) {
+    if !matches!(coin, BtcCoin::Btc | BtcCoin::Tbtc | BtcCoin::Rbtc) {
         return Err(Error::InvalidInput);
     }
     Ok(())
@@ -1260,6 +1260,17 @@ mod tests {
                     ],
                 ),
                 coin
+            )
+            .await
+            .is_ok()
+        );
+
+        // Regtest is supported like testnet.
+        assert!(
+            parse(
+                &mut crate::hal::testing::TestingHal::new(),
+                &make_policy("wsh(pk(@0/**))", core::slice::from_ref(&our_key)),
+                BtcCoin::Rbtc
             )
             .await
             .is_ok()
