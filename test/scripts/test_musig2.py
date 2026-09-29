@@ -79,16 +79,31 @@ def response(kind, index=0, result=None, token=b""):
     )
 
 
-def contribution(index, signing):
+def contribution(index, signing, nonce=None):
     result = btc.BTCMuSig2Result(input_index=index, participant_pubkey=KEY, context_key=KEY)
+    if nonce is None:
+        nonce = not signing
     if signing:
         result.partial_signature = b"p" * 32
-    else:
+    if nonce:
         result.public_nonce = b"n" * 66
     return result
 
 
-def exchanges(signing):
+def peer_nonces():
+    return {
+        index: btc.BTCMuSig2NoncesRequest(
+            input_index=index,
+            context_key=KEY,
+            nonces=[
+                btc.BTCMuSig2Nonce(participant_pubkey=b"\x03" + b"p" * 32, public_nonce=b"m" * 66)
+            ],
+        )
+        for index in range(2)
+    }
+
+
+def exchanges(signing, nonce=None):
     next_type = btc.BTCSignNextResponse
     result = [
         ("btc_sign_init", response(next_type.INPUT, token=TOKEN)),
@@ -107,7 +122,7 @@ def exchanges(signing):
                 response(
                     next_type.DONE if index == 1 else next_type.INPUT,
                     1,
-                    contribution(index, signing),
+                    contribution(index, signing, nonce),
                     TOKEN if index == 1 else b"",
                 ),
             )
@@ -144,6 +159,45 @@ class MuSig2Tests(unittest.TestCase):
                         for index in range(2)
                     }
                 )
+
+    def test_nonce_and_sign(self):
+        session = BTCMuSig2Session({0: CONTEXT, 1: CONTEXT})
+        session.begin_nonce_and_sign(peer_nonces())
+        device = Device(exchanges(True, True))
+        self.assertEqual(
+            device.btc_sign(btc.TBTC, [CONFIG], [INPUT, INPUT], [OUTPUT], musig2=session), []
+        )
+        init = device.requests[0].btc_sign_init.musig2
+        self.assertEqual(init.phase, btc.BTCMuSig2Init.NONCE_AND_SIGN)
+        self.assertEqual(init.session_id, b"")
+        self.assertEqual(session.session_id, TOKEN)
+        for index in range(2):
+            self.assertEqual(session.results[index].public_nonce, b"n" * 66)
+            self.assertEqual(session.results[index].partial_signature, b"p" * 32)
+        nonce_requests = [
+            request.musig2_nonces
+            for request in device.requests
+            if isinstance(request, btc.BTCRequest)
+        ]
+        self.assertEqual(nonce_requests, [peer_nonces()[0], peer_nonces()[1]])
+        self.assertIsNone(next(device.exchanges, None))
+
+        # A single-round session cannot be combined with the two-round API.
+        with self.assertRaises(ValueError):
+            session.begin_sign(peer_nonces())
+        started = BTCMuSig2Session({0: CONTEXT})
+        started.session_id = TOKEN
+        with self.assertRaises(ValueError):
+            started.begin_nonce_and_sign({0: peer_nonces()[0]})
+
+        # Both contributions are required in this phase.
+        session = BTCMuSig2Session({0: CONTEXT})
+        session.begin_nonce_and_sign({0: peer_nonces()[0]})
+        with self.assertRaises(ValueError):
+            session.collect(contribution(0, True, False))
+        with self.assertRaises(ValueError):
+            session.collect(contribution(0, False))
+        session.collect(contribution(0, True, True))
 
     def test_older_firmware(self):
         device = Device([("btc_sign_init", response(btc.BTCSignNextResponse.INPUT))])

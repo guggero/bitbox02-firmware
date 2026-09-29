@@ -115,13 +115,17 @@ class BTCInputType(TypedDict):
 
 
 class BTCMuSig2Session:
-    """Public state for two calls to btc_sign(). No secret nonces leave firmware.
+    """Public state for calls to btc_sign(). No secret nonces leave firmware.
 
     ``inputs`` maps transaction indexes to decoded BIP373/policy contexts. After
     the nonce round, copy ``results`` into PSBT public-nonce fields, collect all
     participants' nonces and call begin_sign(). Submit the identical transaction
     again to obtain partial signatures in ``results``. The coordinator verifies
     and combines these signatures. A device reset/disconnect requires a new round.
+
+    If every other participant already published its nonce, call
+    begin_nonce_and_sign() instead of the nonce round: a single btc_sign() call
+    then fills ``results`` with the device's public nonce and partial signature.
     """
 
     def __init__(self, inputs: Dict[int, btc.BTCMuSig2Input]):
@@ -143,14 +147,23 @@ class BTCMuSig2Session:
         self.nonces = nonces
         self.results = {}
 
+    def begin_nonce_and_sign(self, nonces: Dict[int, btc.BTCMuSig2NoncesRequest]) -> None:
+        """Contribute last: nonces holds every other participant's BIP373 nonce."""
+        if self.phase != btc.BTCMuSig2Init.NONCE or self.session_id or self.results:
+            raise ValueError("A MuSig2 round was already started")
+        if set(nonces) != set(self.inputs):
+            raise ValueError("Invalid MuSig2 nonce set")
+        self.phase = btc.BTCMuSig2Init.NONCE_AND_SIGN
+        self.nonces = nonces
+
     def collect(self, result: btc.BTCMuSig2Result) -> None:
         """Check response routing before exposing a contribution to the PSBT."""
         index = result.input_index
         if index not in self.inputs or index in self.results:
             raise ValueError("Unexpected or duplicate MuSig2 result")
         context = self.inputs[index]
-        nonce_size = 66 if self.phase == btc.BTCMuSig2Init.NONCE else 0
-        signature_size = 32 if self.phase == btc.BTCMuSig2Init.SIGN else 0
+        nonce_size = 66 if self.phase != btc.BTCMuSig2Init.SIGN else 0
+        signature_size = 32 if self.phase != btc.BTCMuSig2Init.NONCE else 0
         if (
             result.context_key != context.context_key
             or result.HasField("tapleaf_hash") != context.HasField("tapleaf_hash")
@@ -530,7 +543,7 @@ class BitBox02(BitBoxCommonAPI):
           inputs/outputs must match the BIP-322 to_sign virtual transaction (first input spends
           to_spend, single OP_RETURN output). Carries the message from PSBT global field
           PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE (0x09).
-        musig2: optional two-round session. Contributions are stored in its results;
+        musig2: optional MuSig2 session. Contributions are stored in its results;
           the return value contains only ordinary signatures (none in the nonce round).
         Returns: list of (input index, signature) tuples.
         Raises Bitbox02Exception with ERR_USER_ABORT on user abort.
@@ -598,7 +611,8 @@ class BitBox02(BitBoxCommonAPI):
             # An older firmware ignores unknown protobuf fields. Require explicit
             # acknowledgement before sending any transaction inputs to it.
             token = next_response.musig2_session_id
-            if len(token) != 32 or (not nonce_round and token != musig2.session_id):
+            fresh = musig2.phase != btc.BTCMuSig2Init.SIGN
+            if len(token) != 32 or (not fresh and token != musig2.session_id):
                 raise ValueError("Firmware did not acknowledge the MuSig2 session")
             musig2.session_id = token
 
