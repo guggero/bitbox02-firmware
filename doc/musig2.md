@@ -24,6 +24,9 @@ followed by the aggregate branch and address index. Only the origin is used to
 derive the private signing key. For example, if `@0` has origin
 `m/48'/1'/0'/3'`, selector `m/48'/1'/0'/3'/1/7` selects aggregate change address 7.
 It does not mean that the participant private key is derived at `/1/7`.
+Participant xpubs at the BIP-48 Taproot path `m/48'/coin'/account'/3'` are
+exported without the unusual-keypath warning, also through the batched xpubs
+request.
 
 The implementation supports Bitcoin mainnet and testnet wallet policies. It
 supports one local participant contribution per transaction input, at most 16
@@ -58,6 +61,27 @@ are not supported in MuSig mode.
    input signatures. A partial signature is a 32-byte scalar, never an ordinary
    `has_signature`/`signature` result. Verify and combine on the host.
 
+### Single round for the last signer
+
+If every other participant already published its public nonce, the device can
+contribute last in a single session with a single transaction review:
+
+1. Send `BTCSignInitRequest` with `musig2.phase = NONCE_AND_SIGN` and an empty
+   session ID. The first response acknowledges the mode with a fresh 32-byte
+   `musig2_session_id`, exactly as in the nonce round.
+2. Stream the transaction once, attaching `BTCMuSig2Input` to each selected input
+   in both input passes.
+3. For every `MUSIG2_NONCES` request, send the public nonces of every **other**
+   participant. Our own nonce must not be included; the device generates it only
+   after the transaction was approved and all other nonces are fixed.
+4. Collect `musig2_result` for every MuSig input, carrying both `public_nonce` and
+   `partial_signature`. Store both in the PSBT.
+
+No secret nonce is retained, so this phase neither requires nor affects a pending
+nonce round, and its session ID cannot be used for `SIGN` or `ABORT`. The
+participants that contributed their nonces earlier then sign with the device's
+nonce included.
+
 Each result carries its own input index. The response's `index` identifies the
 **next request**, which may belong to a different input. After the nested nonce
 request, its response is wrapped as `BTCResponse.sign_next`; direct input/output
@@ -76,8 +100,8 @@ A coordinator retains its PSBT parser and maps fields as follows:
 | Registered aggregate expression | `key_expression`, e.g. `musig(@0,@1)/**` |
 | `0x1b` key data: participant key, context key, optional leaf hash | `BTCMuSig2Nonce.participant_pubkey`, enclosing `context_key`, `tapleaf_hash` |
 | `0x1b` value (66 bytes) | `BTCMuSig2Nonce.public_nonce` |
-| Public-nonce result | Insert `0x1b || participant_pubkey || context_key || [tapleaf_hash]`, value `public_nonce` |
-| Partial-signature result | Insert `0x1c || participant_pubkey || context_key || [tapleaf_hash]`, value `partial_signature` |
+| Public-nonce result (`NONCE`, `NONCE_AND_SIGN`) | Insert `0x1b || participant_pubkey || context_key || [tapleaf_hash]`, value `public_nonce` |
+| Partial-signature result (`SIGN`, `NONCE_AND_SIGN`) | Insert `0x1c || participant_pubkey || context_key || [tapleaf_hash]`, value `partial_signature` |
 
 The aggregate in `0x1a` must equal bare KeyAgg of the registered participant keys.
 For nonce/signature record context keys, the firmware accepts the bare aggregate,
@@ -100,6 +124,11 @@ call `device.btc_sign(...)` again with the same transaction arguments and sessio
 `session.results` now contains partial signatures. The usual return value contains
 only ordinary input signatures. The client checks result routing and completeness.
 `device.btc_musig2_abort(session.session_id)` abandons pending firmware state.
+
+To contribute last, call `session.begin_nonce_and_sign({input_index:
+btc.BTCMuSig2NoncesRequest(...)})` with every other participant's nonces instead
+of running the nonce round. A single `device.btc_sign(...)` call then fills
+`session.results` with the device's public nonce and partial signature.
 
 ## Nonce lifecycle
 
