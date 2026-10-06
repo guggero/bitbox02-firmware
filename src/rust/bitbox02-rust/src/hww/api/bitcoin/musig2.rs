@@ -15,8 +15,11 @@ use pb::btc_mu_sig2_init::Phase;
 pub const MAX_NONCES: usize = 16;
 pub const MAX_INPUTS: usize = 128;
 
+/// A retained secret nonce, for the context at `position` of the input at
+/// `index`.
 struct Slot {
     index: u32,
+    position: u32,
     nonce: SecretNonce,
 }
 
@@ -67,8 +70,10 @@ pub struct Round {
     pub mode: Mode,
     hasher: Sha256,
     inputs: Vec<[u8; 32]>,
+    /// The number of MuSig contexts of all inputs.
     num_nonces: usize,
-    num_signed: usize,
+    /// The number of contexts NONCE_AND_SIGN contributed to or skipped.
+    num_handled: usize,
     approved: bool,
 }
 
@@ -146,7 +151,7 @@ impl Round {
             hasher,
             inputs: Vec::new(),
             num_nonces: 0,
-            num_signed: 0,
+            num_handled: 0,
             approved: false,
         }))
     }
@@ -156,11 +161,18 @@ impl Round {
         if self.inputs.len() >= MAX_INPUTS {
             return Err(Error::InvalidInput);
         }
-        if input.musig2.is_some() {
-            self.num_nonces += 1;
-            if self.num_nonces > MAX_NONCES {
+        // Each context is a different aggregate or leaf of the input.
+        for (position, metadata) in input.musig2.iter().enumerate() {
+            if input.musig2[..position].iter().any(|other| {
+                other.key_expression == metadata.key_expression
+                    && other.tapleaf_hash == metadata.tapleaf_hash
+            }) {
                 return Err(Error::InvalidInput);
             }
+        }
+        self.num_nonces += input.musig2.len();
+        if self.num_nonces > MAX_NONCES {
+            return Err(Error::InvalidInput);
         }
         let hash = input_commitment(input);
         self.inputs.push(hash);
@@ -203,19 +215,28 @@ impl Round {
         &mut self,
         hal: &mut impl crate::hal::Hal,
         index: u32,
+        position: u32,
         context: &SigningContext,
         message: &[u8; 32],
     ) -> Result<[u8; 66], Error> {
         if !self.approved
             || self.mode != Mode::Nonce
             || self.pending.slots.len() >= MAX_NONCES
-            || self.pending.slots.iter().any(|slot| slot.index == index)
+            || self
+                .pending
+                .slots
+                .iter()
+                .any(|slot| slot.index == index && slot.position == position)
         {
             return Err(Error::InvalidState);
         }
         let nonce = self.generate_nonce(hal, context, message).await?;
         let public = nonce.public_nonce();
-        self.pending.slots.push(Slot { index, nonce });
+        self.pending.slots.push(Slot {
+            index,
+            position,
+            nonce,
+        });
         Ok(public)
     }
 
@@ -252,12 +273,13 @@ impl Round {
         message: &[u8; 32],
         request: &pb::BtcMuSig2NoncesRequest,
     ) -> Result<([u8; 66], [u8; 32]), Error> {
-        if !self.approved || self.mode != Mode::NonceAndSign || self.num_signed >= self.num_nonces {
+        if !self.approved || self.mode != Mode::NonceAndSign || self.num_handled >= self.num_nonces
+        {
             return Err(Error::InvalidState);
         }
-        // Count the attempt before anything can fail, so an input cannot be
+        // Count the attempt before anything can fail, so a context cannot be
         // retried within the same round.
-        self.num_signed += 1;
+        self.num_handled += 1;
         let nonce = self.generate_nonce(hal, context, message).await?;
         let public = nonce.public_nonce();
         let nonces = order_nonces(index, metadata, context, request, Some(&public))?;
@@ -279,20 +301,15 @@ impl Round {
         &mut self,
         hal: &mut impl crate::hal::Hal,
         index: u32,
+        position: u32,
         context: &SigningContext,
         message: &[u8; 32],
         nonces: &[[u8; 66]],
     ) -> Result<[u8; 32], Error> {
-        if !self.approved || self.mode != Mode::Sign {
+        if self.mode != Mode::Sign {
             return Err(Error::InvalidState);
         }
-        let position = self
-            .pending
-            .slots
-            .iter()
-            .position(|slot| slot.index == index)
-            .ok_or(Error::InvalidState)?;
-        let slot = self.pending.slots.remove(position);
+        let slot = self.take_slot(index, position)?;
         let secret = crate::keystore::secp256k1_get_private_key(hal, &context.keypath).await?;
         slot.nonce
             .sign(
@@ -302,6 +319,39 @@ impl Round {
                 message,
             )
             .map_err(|_| Error::InvalidInput)
+    }
+
+    /// Remove the retained nonce of a context.
+    fn take_slot(&mut self, index: u32, position: u32) -> Result<Slot, Error> {
+        if !self.approved {
+            return Err(Error::InvalidState);
+        }
+        let slot = self
+            .pending
+            .slots
+            .iter()
+            .position(|slot| slot.index == index && slot.position == position)
+            .ok_or(Error::InvalidState)?;
+        Ok(self.pending.slots.remove(slot))
+    }
+
+    /// Contribute nothing to a context the host cannot complete, e.g. because
+    /// a spend path's other participant is not taking part. A retained nonce
+    /// is destroyed, never reused.
+    pub fn skip(&mut self, index: u32, position: u32) -> Result<(), Error> {
+        match self.mode {
+            Mode::Sign => {
+                self.take_slot(index, position)?;
+            }
+            Mode::NonceAndSign => {
+                if !self.approved || self.num_handled >= self.num_nonces {
+                    return Err(Error::InvalidState);
+                }
+                self.num_handled += 1;
+            }
+            Mode::Nonce => return Err(Error::InvalidState),
+        }
+        Ok(())
     }
 
     /// Complete a round. Return only its public handle; signing rounds retain
@@ -324,7 +374,7 @@ impl Round {
                 }
             }
             Mode::NonceAndSign => {
-                if self.num_signed != self.num_nonces {
+                if self.num_handled != self.num_nonces {
                     return Err(Error::InvalidState);
                 }
             }
@@ -338,8 +388,8 @@ impl Round {
 pub fn context(
     config: &ValidatedScriptConfig,
     input: &pb::BtcSignInputRequest,
+    metadata: &pb::BtcMuSig2Input,
 ) -> Result<SigningContext, Error> {
-    let metadata = input.musig2.as_ref().ok_or(Error::InvalidInput)?;
     if input.host_nonce_commitment.is_some() {
         return Err(Error::InvalidInput);
     }
@@ -468,7 +518,7 @@ mod tests {
             ..Default::default()
         };
         let input = pb::BtcSignInputRequest {
-            musig2: Some(Default::default()),
+            musig2: vec![Default::default()],
             ..Default::default()
         };
         (context, request, input)
@@ -484,7 +534,7 @@ mod tests {
         round.input(input).unwrap();
         round.output(&Default::default());
         round.approve().unwrap();
-        let public = round.nonce(hal, 0, context, &[42; 32]).await.unwrap();
+        let public = round.nonce(hal, 0, 0, context, &[42; 32]).await.unwrap();
         (round.finish().unwrap(), public)
     }
 
@@ -508,12 +558,12 @@ mod tests {
                 .unwrap();
         let nonces = [public, other.public_nonce()];
         round
-            .sign(&mut hal, 0, &context, &[42; 32], &nonces)
+            .sign(&mut hal, 0, 0, &context, &[42; 32], &nonces)
             .await
             .unwrap();
         assert!(
             round
-                .sign(&mut hal, 0, &context, &[42; 32], &nonces)
+                .sign(&mut hal, 0, 0, &context, &[42; 32], &nonces)
                 .await
                 .is_err()
         );
@@ -553,10 +603,15 @@ mod tests {
         );
         round.approve().unwrap();
         // The two-round operations are not available in this mode.
-        assert!(round.nonce(&mut hal, 0, &context, &[42; 32]).await.is_err());
         assert!(
             round
-                .sign(&mut hal, 0, &context, &[42; 32], &[[0; 66]; 2])
+                .nonce(&mut hal, 0, 0, &context, &[42; 32])
+                .await
+                .is_err()
+        );
+        assert!(
+            round
+                .sign(&mut hal, 0, 0, &context, &[42; 32], &[[0; 66]; 2])
                 .await
                 .is_err()
         );
@@ -620,7 +675,7 @@ mod tests {
                 changed.prev_out_value = 1;
             }
             if mutation == 2 {
-                changed.musig2.as_mut().unwrap().context_key = vec![2; 33];
+                changed.musig2[0].context_key = vec![2; 33];
             }
             round.input(&changed).unwrap();
             let mut output = pb::BtcSignOutputRequest::default();
@@ -638,7 +693,7 @@ mod tests {
                 } else {
                     assert!(
                         round
-                            .sign(&mut hal, 0, &context, &[42; 32], &[[0; 66]; 2])
+                            .sign(&mut hal, 0, 0, &context, &[42; 32], &[[0; 66]; 2])
                             .await
                             .is_err()
                     );
@@ -668,7 +723,12 @@ mod tests {
         assert!(Round::begin(&mut hal, &request).await.is_err());
         request.num_inputs = MAX_INPUTS as u32;
         let mut round = Round::begin(&mut hal, &request).await.unwrap().unwrap();
-        assert!(round.nonce(&mut hal, 0, &context, &[42; 32]).await.is_err());
+        assert!(
+            round
+                .nonce(&mut hal, 0, 0, &context, &[42; 32])
+                .await
+                .is_err()
+        );
         assert!(round.approve().is_err());
         for _ in 0..MAX_NONCES {
             round.input(&input).unwrap();
@@ -695,6 +755,7 @@ mod tests {
         };
         let request = pb::BtcMuSig2NoncesRequest {
             input_index: 2,
+            skip: false,
             context_key: metadata.context_key.clone(),
             tapleaf_hash: metadata.tapleaf_hash.clone(),
             nonces: context

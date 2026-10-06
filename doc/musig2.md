@@ -28,13 +28,14 @@ Participant xpubs at the BIP-48 Taproot path `m/48'/coin'/account'/3'` are
 exported without the unusual-keypath warning, also through the batched xpubs
 request.
 
-The implementation supports Bitcoin mainnet and testnet wallet policies. It
-supports one local participant contribution per transaction input, at most 16
-MuSig inputs, at most 128 total inputs in a MuSig session, and the existing policy
-limit of 20 keys. Ordinary simple-script and policy inputs can share a MuSig
+The implementation supports Bitcoin mainnet, testnet and regtest wallet policies.
+An input can carry several MuSig contexts of ours, one per aggregate our key is
+part of, e.g. the key path and a leaf of a 2-of-3 policy. It supports at most 16
+contexts in a session, at most 128 total inputs in a MuSig session, and the
+existing policy limit of 20 keys. Ordinary simple-script and policy inputs can share a MuSig
 transaction. Only SIGHASH_DEFAULT is supported for Taproot. Raw aggregate-key
-wallets, custom aggregate chain codes, multiple contributions for one input,
-legacy multisig configs mixed into this mode, BIP322, and silent-payment outputs
+wallets, custom aggregate chain codes, two contexts for the same aggregate and
+leaf of one input, legacy multisig configs mixed into this mode, BIP322, and silent-payment outputs
 are not supported in MuSig mode.
 
 ## Wire exchange
@@ -43,22 +44,28 @@ are not supported in MuSig mode.
    The first `BTCSignNextResponse` acknowledges the mode with a fresh 32-byte
    `musig2_session_id`. Require this acknowledgement before streaming inputs;
    older firmware ignores unknown protobuf fields.
-2. Stream the transaction as usual. Attach `BTCMuSig2Input` to each selected
-   input in **both** input passes. The device validates policy ownership and
-   reviews the transaction with the user before generating nonces.
-3. Collect `musig2_result.public_nonce` contributions, including any result
-   attached to `DONE`. No ordinary signatures are produced in this round.
+2. Stream the transaction as usual. Attach a `BTCMuSig2Input` for every MuSig
+   context of ours to each input in **both** input passes, i.e. for every
+   aggregate our key is part of the input can be spent with. The device validates
+   policy ownership and reviews the transaction with the user before generating
+   nonces.
+3. Collect the `musig2_results` public nonce contributions, one per context,
+   including any results attached to `DONE`. No ordinary signatures are produced in this round.
    `DONE` repeats the session ID. Keep the same device/wallet/Noise session.
 4. Exchange public nonces with the other participants through the PSBT. Resubmit
    the identical transaction with `musig2.phase = SIGN` and the returned session
    ID. Transaction fields, policies, input contexts, and output metadata must
    match the nonce round. The user reviews the transaction again.
-5. For every `MUSIG2_NONCES` request, send `BTCRequest.musig2_nonces` containing
-   the complete set of participants' public nonces, including the device's own.
-   Records may arrive in any order. The firmware validates their tuple and
-   reorders them to the aggregation order.
-6. Collect `musig2_result.partial_signature`, also on `DONE`, and any ordinary
-   input signatures. A partial signature is a 32-byte scalar, never an ordinary
+5. Every `MUSIG2_NONCES` request names the input in `index` and the position of
+   the context in its `BTCSignInputRequest.musig2` in `musig2_index`. Send
+   `BTCRequest.musig2_nonces` containing the complete set of participants' public
+   nonces, including the device's own. Records may arrive in any order. The
+   firmware validates their tuple and reorders them to the aggregation order. If a
+   participant's nonce of the context is missing, e.g. because the spend uses
+   another of our aggregates, set `skip` and send no nonces instead: the device
+   destroys the context's secret nonce and contributes nothing to it.
+6. Collect the `musig2_results` partial signatures, also on `DONE`, and any
+   ordinary input signatures. A partial signature is a 32-byte scalar, never an ordinary
    `has_signature`/`signature` result. Verify and combine on the host.
 
 ### Single round for the last signer
@@ -73,9 +80,10 @@ contribute last in a single session with a single transaction review:
    in both input passes.
 3. For every `MUSIG2_NONCES` request, send the public nonces of every **other**
    participant. Our own nonce must not be included; the device generates it only
-   after the transaction was approved and all other nonces are fixed.
-4. Collect `musig2_result` for every MuSig input, carrying both `public_nonce` and
-   `partial_signature`. Store both in the PSBT.
+   after the transaction was approved and all other nonces are fixed. Skip the
+   contexts another participant's nonce is missing for.
+4. Collect `musig2_results` for every context that was not skipped, carrying both
+   `public_nonce` and `partial_signature`. Store both in the PSBT.
 
 No secret nonce is retained, so this phase neither requires nor affects a pending
 nonce round, and its session ID cannot be used for `SIGN` or `ABORT`. The
@@ -114,8 +122,10 @@ Unknown, missing, duplicated, mismatched, or malformed participant records fail.
 
 ## Python client
 
-Create `BTCMuSig2Session({input_index: btc.BTCMuSig2Input(...)})` and pass it as
-`musig2=session` to `device.btc_sign(...)`. The first call returns no ordinary
+Create `BTCMuSig2Session({input_index: btc.BTCMuSig2Input(...)})`, or with a list
+of contexts per input, and pass it as `musig2=session` to `device.btc_sign(...)`.
+Nonces and results are keyed by `(input_index, position)`, or by `input_index`
+for the first context of an input. The first call returns no ordinary
 signatures and fills `session.results` with public nonces. Save those records
 into the PSBT and collect all participants' nonces.
 

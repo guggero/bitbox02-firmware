@@ -433,7 +433,8 @@ class BTCSignNextResponse(google.protobuf.message.Message):
     GENERATED_OUTPUT_PKSCRIPT_FIELD_NUMBER: builtins.int
     SILENT_PAYMENT_DLEQ_PROOF_FIELD_NUMBER: builtins.int
     MUSIG2_SESSION_ID_FIELD_NUMBER: builtins.int
-    MUSIG2_RESULT_FIELD_NUMBER: builtins.int
+    MUSIG2_RESULTS_FIELD_NUMBER: builtins.int
+    MUSIG2_INDEX_FIELD_NUMBER: builtins.int
     type: global___BTCSignNextResponse.Type.ValueType
     index: builtins.int
     """index of the current input or output"""
@@ -447,10 +448,16 @@ class BTCSignNextResponse(google.protobuf.message.Message):
     """Generated output. The host *must* verify its correctness using `silent_payment_dleq_proof`."""
     silent_payment_dleq_proof: builtins.bytes
     musig2_session_id: builtins.bytes
+    musig2_index: builtins.int
+    """For MUSIG2_NONCES: the position of the context in BTCSignInputRequest.musig2
+    of the input at `index` the nonces are requested for.
+    """
     @property
     def anti_klepto_signer_commitment(self) -> antiklepto_pb2.AntiKleptoSignerCommitment: ...
     @property
-    def musig2_result(self) -> global___BTCMuSig2Result: ...
+    def musig2_results(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[global___BTCMuSig2Result]:
+        """Contributions to the MuSig2 contexts of the inputs, see BTCMuSig2Result."""
+
     def __init__(
         self,
         *,
@@ -463,10 +470,11 @@ class BTCSignNextResponse(google.protobuf.message.Message):
         generated_output_pkscript: builtins.bytes = ...,
         silent_payment_dleq_proof: builtins.bytes = ...,
         musig2_session_id: builtins.bytes = ...,
-        musig2_result: global___BTCMuSig2Result | None = ...,
+        musig2_results: collections.abc.Iterable[global___BTCMuSig2Result] | None = ...,
+        musig2_index: builtins.int = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "musig2_result", b"musig2_result"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "generated_output_pkscript", b"generated_output_pkscript", "has_signature", b"has_signature", "index", b"index", "musig2_result", b"musig2_result", "musig2_session_id", b"musig2_session_id", "prev_index", b"prev_index", "signature", b"signature", "silent_payment_dleq_proof", b"silent_payment_dleq_proof", "type", b"type"]) -> None: ...
+    def HasField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment"]) -> builtins.bool: ...
+    def ClearField(self, field_name: typing.Literal["anti_klepto_signer_commitment", b"anti_klepto_signer_commitment", "generated_output_pkscript", b"generated_output_pkscript", "has_signature", b"has_signature", "index", b"index", "musig2_index", b"musig2_index", "musig2_results", b"musig2_results", "musig2_session_id", b"musig2_session_id", "prev_index", b"prev_index", "signature", b"signature", "silent_payment_dleq_proof", b"silent_payment_dleq_proof", "type", b"type"]) -> None: ...
 
 global___BTCSignNextResponse = BTCSignNextResponse
 
@@ -500,7 +508,13 @@ class BTCSignInputRequest(google.protobuf.message.Message):
         """
 
     @property
-    def musig2(self) -> global___BTCMuSig2Input: ...
+    def musig2(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[global___BTCMuSig2Input]:
+        """Every MuSig2 context of ours the input can be spent with, e.g. the key path
+        aggregate and a leaf aggregate. The list must be identical in all rounds of
+        a session; contexts the host cannot complete are skipped in the nonce
+        exchange instead, see BTCMuSig2NoncesRequest.skip.
+        """
+
     def __init__(
         self,
         *,
@@ -511,9 +525,9 @@ class BTCSignInputRequest(google.protobuf.message.Message):
         keypath: collections.abc.Iterable[builtins.int] | None = ...,
         script_config_index: builtins.int = ...,
         host_nonce_commitment: antiklepto_pb2.AntiKleptoHostNonceCommitment | None = ...,
-        musig2: global___BTCMuSig2Input | None = ...,
+        musig2: collections.abc.Iterable[global___BTCMuSig2Input] | None = ...,
     ) -> None: ...
-    def HasField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment", "musig2", b"musig2"]) -> builtins.bool: ...
+    def HasField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment"]) -> builtins.bool: ...
     def ClearField(self, field_name: typing.Literal["host_nonce_commitment", b"host_nonce_commitment", "keypath", b"keypath", "musig2", b"musig2", "prevOutHash", b"prevOutHash", "prevOutIndex", b"prevOutIndex", "prevOutValue", b"prevOutValue", "script_config_index", b"script_config_index", "sequence", b"sequence"]) -> None: ...
 
 global___BTCSignInputRequest = BTCSignInputRequest
@@ -637,13 +651,19 @@ class BTCMuSig2NoncesRequest(google.protobuf.message.Message):
     CONTEXT_KEY_FIELD_NUMBER: builtins.int
     TAPLEAF_HASH_FIELD_NUMBER: builtins.int
     NONCES_FIELD_NUMBER: builtins.int
+    SKIP_FIELD_NUMBER: builtins.int
     input_index: builtins.int
     context_key: builtins.bytes
     tapleaf_hash: builtins.bytes
+    skip: builtins.bool
+    """Contribute nothing to this context, e.g. because a participant's nonce is
+    missing. A retained secret nonce of the context is destroyed.
+    """
     @property
     def nonces(self) -> google.protobuf.internal.containers.RepeatedCompositeFieldContainer[global___BTCMuSig2Nonce]:
         """Exactly one record per participant, in arbitrary map order. SIGN includes
-        ours; NONCE_AND_SIGN includes every participant except us.
+        ours; NONCE_AND_SIGN includes every participant except us. Empty if skip
+        is set.
         """
 
     def __init__(
@@ -653,9 +673,10 @@ class BTCMuSig2NoncesRequest(google.protobuf.message.Message):
         context_key: builtins.bytes = ...,
         tapleaf_hash: builtins.bytes | None = ...,
         nonces: collections.abc.Iterable[global___BTCMuSig2Nonce] | None = ...,
+        skip: builtins.bool = ...,
     ) -> None: ...
     def HasField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "tapleaf_hash", b"tapleaf_hash"]) -> builtins.bool: ...
-    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "nonces", b"nonces", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
+    def ClearField(self, field_name: typing.Literal["_tapleaf_hash", b"_tapleaf_hash", "context_key", b"context_key", "input_index", b"input_index", "nonces", b"nonces", "skip", b"skip", "tapleaf_hash", b"tapleaf_hash"]) -> None: ...
     def WhichOneof(self, oneof_group: typing.Literal["_tapleaf_hash", b"_tapleaf_hash"]) -> typing.Literal["tapleaf_hash"] | None: ...
 
 global___BTCMuSig2NoncesRequest = BTCMuSig2NoncesRequest

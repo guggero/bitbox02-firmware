@@ -152,7 +152,11 @@ message BTCSignNextResponse {
   bytes generated_output_pkscript = 7;
   bytes silent_payment_dleq_proof = 8;
   bytes musig2_session_id = 9;
-  BTCMuSig2Result musig2_result = 10;
+  // Contributions to the MuSig2 contexts of the inputs, see BTCMuSig2Result.
+  repeated BTCMuSig2Result musig2_results = 10;
+  // For MUSIG2_NONCES: the position of the context in BTCSignInputRequest.musig2
+  // of the input at `index` the nonces are requested for.
+  uint32 musig2_index = 11;
 }
 
 message BTCSignInputRequest {
@@ -166,7 +170,11 @@ message BTCSignInputRequest {
   // If omitted, the signature uses the historical deterministic zero-contribution S2C fallback.
   // This differs from plain RFC6979 and does not provide anti-klepto protection.
   AntiKleptoHostNonceCommitment host_nonce_commitment = 8;
-  BTCMuSig2Input musig2 = 9;
+  // Every MuSig2 context of ours the input can be spent with, e.g. the key path
+  // aggregate and a leaf aggregate. The list must be identical in all rounds of
+  // a session; contexts the host cannot complete are skipped in the nonce
+  // exchange instead, see BTCMuSig2NoncesRequest.skip.
+  repeated BTCMuSig2Input musig2 = 9;
 }
 
 // Secret nonces remain in volatile device memory between these rounds.
@@ -214,8 +222,12 @@ message BTCMuSig2NoncesRequest {
   bytes context_key = 2;
   optional bytes tapleaf_hash = 3;
   // Exactly one record per participant, in arbitrary map order. SIGN includes
-  // ours; NONCE_AND_SIGN includes every participant except us.
+  // ours; NONCE_AND_SIGN includes every participant except us. Empty if skip
+  // is set.
   repeated BTCMuSig2Nonce nonces = 4;
+  // Contribute nothing to this context, e.g. because a participant's nonce is
+  // missing. A retained secret nonce of the context is destroyed.
+  bool skip = 5;
 }
 
 message BTCMuSig2Result {

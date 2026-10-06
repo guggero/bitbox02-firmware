@@ -73,9 +73,13 @@ class Device:
         return btc.BTCResponse(sign_next=self.exchange(request, request.WhichOneof("request")))
 
 
-def response(kind, index=0, result=None, token=b""):
+def response(kind, index=0, result=None, token=b"", musig2_index=0):
     return btc.BTCSignNextResponse(
-        type=kind, index=index, musig2_result=result, musig2_session_id=token
+        type=kind,
+        index=index,
+        musig2_results=[] if result is None else [result],
+        musig2_session_id=token,
+        musig2_index=musig2_index,
     )
 
 
@@ -140,10 +144,10 @@ class MuSig2Tests(unittest.TestCase):
                 device.btc_sign(btc.TBTC, [CONFIG], [INPUT, INPUT], [OUTPUT], musig2=session), []
             )
             self.assertEqual(session.session_id, TOKEN)
-            self.assertEqual(set(session.results), {0, 1})
+            self.assertEqual(set(session.results), {(0, 0), (1, 0)})
             for request in device.requests:
                 if isinstance(request, hww.Request) and request.HasField("btc_sign_input"):
-                    self.assertEqual(request.btc_sign_input.musig2, CONTEXT)
+                    self.assertEqual(list(request.btc_sign_input.musig2), [CONTEXT])
                     self.assertFalse(request.btc_sign_input.HasField("host_nonce_commitment"))
             self.assertIsNone(next(device.exchanges, None))
             if not signing:
@@ -172,8 +176,8 @@ class MuSig2Tests(unittest.TestCase):
         self.assertEqual(init.session_id, b"")
         self.assertEqual(session.session_id, TOKEN)
         for index in range(2):
-            self.assertEqual(session.results[index].public_nonce, b"n" * 66)
-            self.assertEqual(session.results[index].partial_signature, b"p" * 32)
+            self.assertEqual(session.results[(index, 0)].public_nonce, b"n" * 66)
+            self.assertEqual(session.results[(index, 0)].partial_signature, b"p" * 32)
         nonce_requests = [
             request.musig2_nonces
             for request in device.requests
@@ -209,7 +213,7 @@ class MuSig2Tests(unittest.TestCase):
 
     def test_missing_done_result(self):
         script = exchanges(False)
-        script[-1][1].ClearField("musig2_result")
+        script[-1][1].ClearField("musig2_results")
         with self.assertRaisesRegex(ValueError, "Incomplete"):
             Device(script).btc_sign(
                 btc.TBTC,
@@ -235,14 +239,71 @@ class MuSig2Tests(unittest.TestCase):
         script = exchanges(False)
         script[0][1].ClearField("musig2_session_id")
         for _, reply in script:
-            if reply.HasField("musig2_result"):
-                reply.ClearField("musig2_result")
+            if reply.musig2_results:
+                reply.ClearField("musig2_results")
                 reply.has_signature = True
                 reply.signature = b"s" * 64
         self.assertEqual(
             Device(script).btc_sign(btc.TBTC, [CONFIG], [INPUT, INPUT], [OUTPUT]),
             [(0, b"s" * 64), (1, b"s" * 64)],
         )
+
+    def test_several_contexts(self):
+        # The input's second context is a leaf the host cannot complete: it is
+        # skipped in the signing round and gets no result.
+        leaf = btc.BTCMuSig2Input()
+        leaf.CopyFrom(CONTEXT)
+        leaf.key_expression = "musig(@0,@2)/**"
+        leaf.tapleaf_hash = b"l" * 32
+        session = BTCMuSig2Session({0: [CONTEXT, leaf]})
+        next_type = btc.BTCSignNextResponse
+        nonce_round = [
+            ("btc_sign_init", response(next_type.INPUT, token=TOKEN)),
+            ("btc_sign_input", response(next_type.OUTPUT)),
+            ("btc_sign_output", response(next_type.INPUT)),
+        ]
+        leaf_nonce = contribution(0, False)
+        leaf_nonce.tapleaf_hash = leaf.tapleaf_hash
+        done = response(next_type.DONE, 0, contribution(0, False), TOKEN)
+        done.musig2_results.append(leaf_nonce)
+        nonce_round.append(("btc_sign_input", done))
+        device = Device(nonce_round)
+        device.btc_sign(btc.TBTC, [CONFIG], [INPUT], [OUTPUT], musig2=session)
+        self.assertEqual(set(session.results), {(0, 0), (0, 1)})
+        sent = [
+            list(request.btc_sign_input.musig2)
+            for request in device.requests
+            if isinstance(request, hww.Request) and request.HasField("btc_sign_input")
+        ]
+        self.assertEqual(sent, [[CONTEXT, leaf], [CONTEXT, leaf]])
+
+        complete = btc.BTCMuSig2NoncesRequest(
+            input_index=0,
+            context_key=KEY,
+            nonces=[btc.BTCMuSig2Nonce(participant_pubkey=KEY, public_nonce=b"n" * 66)],
+        )
+        skipped = btc.BTCMuSig2NoncesRequest(
+            input_index=0, context_key=KEY, tapleaf_hash=leaf.tapleaf_hash, skip=True
+        )
+        session.begin_sign({0: complete, (0, 1): skipped})
+        signing_round = nonce_round[:3] + [
+            ("btc_sign_input", response(next_type.MUSIG2_NONCES, 0)),
+            ("musig2_nonces", response(next_type.MUSIG2_NONCES, 0, musig2_index=1)),
+            ("musig2_nonces", response(next_type.DONE, 0, contribution(0, True), TOKEN)),
+        ]
+        device = Device(signing_round)
+        device.btc_sign(btc.TBTC, [CONFIG], [INPUT], [OUTPUT], musig2=session)
+        self.assertEqual(set(session.results), {(0, 0)})
+        nonce_requests = [
+            request.musig2_nonces
+            for request in device.requests
+            if isinstance(request, btc.BTCRequest)
+        ]
+        self.assertEqual(nonce_requests, [complete, skipped])
+
+        # A result for the skipped context is refused.
+        with self.assertRaisesRegex(ValueError, "Unexpected"):
+            session.collect(leaf_nonce)
 
 
 if __name__ == "__main__":

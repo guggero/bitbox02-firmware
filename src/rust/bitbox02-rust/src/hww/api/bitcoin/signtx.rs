@@ -984,7 +984,7 @@ async fn process_bip322(
         }
 
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
-        if tx_input.musig2.is_some() {
+        if !tx_input.musig2.is_empty() {
             return Err(Error::InvalidInput);
         }
         let script_config_account = validated_script_configs
@@ -1101,7 +1101,7 @@ async fn process_bip322(
     let mut proven_sum_pass2: u64 = 0;
     for input_index in 0..request.num_inputs {
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
-        if tx_input.musig2.is_some() {
+        if !tx_input.musig2.is_empty() {
             return Err(Error::InvalidInput);
         }
         let script_config_account = validated_script_configs
@@ -1319,10 +1319,10 @@ async fn _process(
         validate_input(&tx_input, coin_params, script_config_account)?;
         if let Some(round) = musig_round.as_mut() {
             round.input(&tx_input)?;
-            if tx_input.musig2.is_some() {
-                musig2::context(&script_config_account.config, &tx_input)?;
+            for metadata in &tx_input.musig2 {
+                musig2::context(&script_config_account.config, &tx_input, metadata)?;
             }
-        } else if tx_input.musig2.is_some() {
+        } else if !tx_input.musig2.is_empty() {
             return Err(Error::InvalidInput);
         }
 
@@ -1758,64 +1758,88 @@ async fn _process(
             return Err(Error::InvalidInput);
         }
 
-        if let Some(metadata) = &tx_input.musig2 {
+        if !tx_input.musig2.is_empty() {
             let round = musig_round.as_mut().ok_or(Error::InvalidInput)?;
-            let context = musig2::context(&script_config_account.config, &tx_input)?;
-            let sighash = bip341::sighash(&bip341::Args {
-                version: request.version,
-                locktime: request.locktime,
-                hash_prevouts: tx_hashes.hash_prevouts,
-                hash_amounts: tx_hashes.hash_amounts,
-                hash_scriptpubkeys: tx_hashes.hash_scriptpubkeys,
-                hash_sequences: tx_hashes.hash_sequence,
-                hash_outputs: tx_hashes.hash_outputs,
-                input_index,
-                tapleaf_hash: context.tapleaf_hash,
-            });
-            let mut result = pb::BtcMuSig2Result {
-                input_index,
-                participant_pubkey: context.participant.to_vec(),
-                context_key: metadata.context_key.clone(),
-                tapleaf_hash: metadata.tapleaf_hash.clone(),
-                ..Default::default()
-            };
-            if round.mode == musig2::Mode::Nonce {
-                result.public_nonce = round
-                    .nonce(hal, input_index, &context, &sighash)
-                    .await?
-                    .to_vec();
-            } else {
-                // This is a BIP373 public-nonce exchange, independent of ECDSA anti-klepto.
-                let request = get_request(
-                    NextType::Musig2Nonces,
+            for (position, metadata) in tx_input.musig2.iter().enumerate() {
+                let position = position as u32;
+                let context = musig2::context(&script_config_account.config, &tx_input, metadata)?;
+                let sighash = bip341::sighash(&bip341::Args {
+                    version: request.version,
+                    locktime: request.locktime,
+                    hash_prevouts: tx_hashes.hash_prevouts,
+                    hash_amounts: tx_hashes.hash_amounts,
+                    hash_scriptpubkeys: tx_hashes.hash_scriptpubkeys,
+                    hash_sequences: tx_hashes.hash_sequence,
+                    hash_outputs: tx_hashes.hash_outputs,
                     input_index,
-                    None,
-                    &mut next_response,
-                )
-                .await?;
-                next_response.wrap = true;
-                let Request::Btc(pb::BtcRequest {
-                    request: Some(pb::btc_request::Request::Musig2Nonces(request)),
-                }) = request
-                else {
-                    return Err(Error::InvalidState);
+                    tapleaf_hash: context.tapleaf_hash,
+                });
+                let mut result = pb::BtcMuSig2Result {
+                    input_index,
+                    participant_pubkey: context.participant.to_vec(),
+                    context_key: metadata.context_key.clone(),
+                    tapleaf_hash: metadata.tapleaf_hash.clone(),
+                    ..Default::default()
                 };
-                if round.mode == musig2::Mode::Sign {
-                    let nonces =
-                        musig2::order_nonces(input_index, metadata, &context, &request, None)?;
-                    result.partial_signature = round
-                        .sign(hal, input_index, &context, &sighash, &nonces)
+                if round.mode == musig2::Mode::Nonce {
+                    result.public_nonce = round
+                        .nonce(hal, input_index, position, &context, &sighash)
                         .await?
                         .to_vec();
                 } else {
-                    let (public_nonce, partial_signature) = round
-                        .nonce_and_sign(hal, input_index, metadata, &context, &sighash, &request)
-                        .await?;
-                    result.public_nonce = public_nonce.to_vec();
-                    result.partial_signature = partial_signature.to_vec();
+                    // This is a BIP373 public-nonce exchange, independent of ECDSA anti-klepto.
+                    next_response.next.musig2_index = position;
+                    let request = get_request(
+                        NextType::Musig2Nonces,
+                        input_index,
+                        None,
+                        &mut next_response,
+                    )
+                    .await?;
+                    next_response.wrap = true;
+                    let Request::Btc(pb::BtcRequest {
+                        request: Some(pb::btc_request::Request::Musig2Nonces(request)),
+                    }) = request
+                    else {
+                        return Err(Error::InvalidState);
+                    };
+                    if request.skip {
+                        // The host cannot complete this context, e.g. because another of
+                        // our spend paths is used.
+                        if !request.nonces.is_empty()
+                            || request.input_index != input_index
+                            || request.context_key != metadata.context_key
+                            || request.tapleaf_hash != metadata.tapleaf_hash
+                        {
+                            return Err(Error::InvalidInput);
+                        }
+                        round.skip(input_index, position)?;
+                        continue;
+                    }
+                    if round.mode == musig2::Mode::Sign {
+                        let nonces =
+                            musig2::order_nonces(input_index, metadata, &context, &request, None)?;
+                        result.partial_signature = round
+                            .sign(hal, input_index, position, &context, &sighash, &nonces)
+                            .await?
+                            .to_vec();
+                    } else {
+                        let (public_nonce, partial_signature) = round
+                            .nonce_and_sign(
+                                hal,
+                                input_index,
+                                metadata,
+                                &context,
+                                &sighash,
+                                &request,
+                            )
+                            .await?;
+                        result.public_nonce = public_nonce.to_vec();
+                        result.partial_signature = partial_signature.to_vec();
+                    }
                 }
+                next_response.next.musig2_results.push(result);
             }
-            next_response.next.musig2_result = Some(result);
         } else if musig_round
             .as_ref()
             .is_some_and(|round| round.mode == musig2::Mode::Nonce)
@@ -2019,7 +2043,7 @@ mod tests {
                 inputs: vec![
                     TxInput {
                         input: pb::BtcSignInputRequest {
-                            musig2: None,
+                            musig2: vec![],
                             prev_out_hash: vec![
                                 0x45, 0x17, 0x74, 0x50, 0x1b, 0xaf, 0xdf, 0xf7, 0x46, 0x9, 0xe,
                                 0x6, 0x16, 0xd9, 0x5e, 0xd0, 0x80, 0xd7, 0x82, 0x9a, 0xfe, 0xa2,
@@ -2073,7 +2097,7 @@ mod tests {
                     },
                     TxInput {
                         input: pb::BtcSignInputRequest {
-                            musig2: None,
+                            musig2: vec![],
                             prev_out_hash: vec![
                                 0x40, 0x9b, 0x4f, 0x56, 0xca, 0x9f, 0x6, 0xcb, 0x88, 0x28, 0x3,
                                 0xad, 0x55, 0x4b, 0xeb, 0x1d, 0x9e, 0xf8, 0x78, 0x7, 0xf0, 0x52,
@@ -2180,7 +2204,7 @@ mod tests {
                 version: 2,
                 inputs: vec![TxInput {
                     input: pb::BtcSignInputRequest {
-                        musig2: None,
+                        musig2: vec![],
                         prev_out_hash: vec![
                             0x41, 0x3b, 0x8e, 0x74, 0x05, 0x15, 0x96, 0x6b, 0x20, 0x2b, 0x24, 0xc3,
                             0x19, 0xfc, 0xf3, 0x5f, 0xc5, 0x37, 0x6e, 0xb2, 0x71, 0x95, 0xb8, 0x76,
@@ -2513,7 +2537,7 @@ mod tests {
 
         TxInput {
             input: pb::BtcSignInputRequest {
-                musig2: None,
+                musig2: vec![],
                 prev_out_hash: input.prev_out_hash.to_byte_array().to_vec(),
                 prev_out_index: input.prev_out_index,
                 prev_out_value: input.prev_out_value,
@@ -3460,7 +3484,7 @@ mod tests {
         // transaction.
         let mut inputs = vec![TxInput {
             input: pb::BtcSignInputRequest {
-                musig2: None,
+                musig2: vec![],
                 prev_out_hash: bip322::create_to_spend_txid(message, &scripts[0]).to_vec(),
                 prev_out_index: 0,
                 prev_out_value: 0,
@@ -3478,7 +3502,7 @@ mod tests {
         for (index, coin) in coins.iter().enumerate() {
             let mut input = TxInput {
                 input: pb::BtcSignInputRequest {
-                    musig2: None,
+                    musig2: vec![],
                     prev_out_hash: vec![],
                     prev_out_index: 0,
                     prev_out_value: coin.value,

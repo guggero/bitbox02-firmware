@@ -751,8 +751,13 @@ pub struct BtcSignNextResponse {
     pub silent_payment_dleq_proof: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "9")]
     pub musig2_session_id: ::prost::alloc::vec::Vec<u8>,
-    #[prost(message, optional, tag = "10")]
-    pub musig2_result: ::core::option::Option<BtcMuSig2Result>,
+    /// Contributions to the MuSig2 contexts of the inputs, see BTCMuSig2Result.
+    #[prost(message, repeated, tag = "10")]
+    pub musig2_results: ::prost::alloc::vec::Vec<BtcMuSig2Result>,
+    /// For MUSIG2_NONCES: the position of the context in BTCSignInputRequest.musig2
+    /// of the input at `index` the nonces are requested for.
+    #[prost(uint32, tag = "11")]
+    pub musig2_index: u32,
 }
 /// Nested message and enum types in `BTCSignNextResponse`.
 pub mod btc_sign_next_response {
@@ -827,8 +832,12 @@ pub struct BtcSignInputRequest {
     /// This differs from plain RFC6979 and does not provide anti-klepto protection.
     #[prost(message, optional, tag = "8")]
     pub host_nonce_commitment: ::core::option::Option<AntiKleptoHostNonceCommitment>,
-    #[prost(message, optional, tag = "9")]
-    pub musig2: ::core::option::Option<BtcMuSig2Input>,
+    /// Every MuSig2 context of ours the input can be spent with, e.g. the key path
+    /// aggregate and a leaf aggregate. The list must be identical in all rounds of
+    /// a session; contexts the host cannot complete are skipped in the nonce
+    /// exchange instead, see BTCMuSig2NoncesRequest.skip.
+    #[prost(message, repeated, tag = "9")]
+    pub musig2: ::prost::alloc::vec::Vec<BtcMuSig2Input>,
 }
 /// Secret nonces remain in volatile device memory between these rounds.
 /// Cancel, lock, disconnect or a new Noise session requires fresh nonces.
@@ -923,9 +932,14 @@ pub struct BtcMuSig2NoncesRequest {
     #[prost(bytes = "vec", optional, tag = "3")]
     pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     /// Exactly one record per participant, in arbitrary map order. SIGN includes
-    /// ours; NONCE_AND_SIGN includes every participant except us.
+    /// ours; NONCE_AND_SIGN includes every participant except us. Empty if skip
+    /// is set.
     #[prost(message, repeated, tag = "4")]
     pub nonces: ::prost::alloc::vec::Vec<BtcMuSig2Nonce>,
+    /// Contribute nothing to this context, e.g. because a participant's nonce is
+    /// missing. A retained secret nonce of the context is destroyed.
+    #[prost(bool, tag = "5")]
+    pub skip: bool,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]

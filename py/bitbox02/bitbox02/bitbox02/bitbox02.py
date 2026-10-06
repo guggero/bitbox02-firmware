@@ -6,7 +6,7 @@ import os
 import sys
 import time
 from datetime import datetime, timezone
-from typing import Optional, List, Dict, Tuple, Any, Generator, Union, Sequence
+from typing import Optional, List, Dict, Set, Tuple, Any, Generator, Union, Sequence
 from typing_extensions import TypedDict
 
 import semver
@@ -114,66 +114,111 @@ class BTCInputType(TypedDict):
     prev_tx: Optional[BTCPrevTxType]
 
 
+MuSig2Contexts = Union[btc.BTCMuSig2Input, Sequence[btc.BTCMuSig2Input]]
+MuSig2Key = Union[int, Tuple[int, int]]
+
+
+def _musig2_key(key: MuSig2Key) -> Tuple[int, int]:
+    """(input index, context position); a plain input index is its first context."""
+    return (key, 0) if isinstance(key, int) else key
+
+
 class BTCMuSig2Session:
     """Public state for calls to btc_sign(). No secret nonces leave firmware.
 
-    ``inputs`` maps transaction indexes to decoded BIP373/policy contexts. After
-    the nonce round, copy ``results`` into PSBT public-nonce fields, collect all
-    participants' nonces and call begin_sign(). Submit the identical transaction
-    again to obtain partial signatures in ``results``. The coordinator verifies
-    and combines these signatures. A device reset/disconnect requires a new round.
+    ``inputs`` maps transaction indexes to decoded BIP373/policy contexts, one or a
+    list of them per input, e.g. the key path and a leaf aggregate our key is part
+    of. After the nonce round, copy ``results`` into PSBT public-nonce fields,
+    collect all participants' nonces and call begin_sign(). Submit the identical
+    transaction again to obtain partial signatures in ``results``. The
+    coordinator verifies and combines these signatures. A device reset/disconnect
+    requires a new round.
 
     If every other participant already published its nonce, call
     begin_nonce_and_sign() instead of the nonce round: a single btc_sign() call
     then fills ``results`` with the device's public nonce and partial signature.
+
+    ``results`` and the nonces are keyed by (input index, context position), or
+    by the input index for its first context. A context the host cannot complete
+    gets a nonces request with ``skip`` set and no result.
     """
 
-    def __init__(self, inputs: Dict[int, btc.BTCMuSig2Input]):
+    def __init__(self, inputs: Dict[int, MuSig2Contexts]):
         if not inputs:
             raise ValueError("MuSig2 inputs are required")
-        self.inputs = inputs
+        self.inputs: Dict[int, List[btc.BTCMuSig2Input]] = {
+            index: [contexts] if isinstance(contexts, btc.BTCMuSig2Input) else list(contexts)
+            for index, contexts in inputs.items()
+        }
+        if any(not contexts for contexts in self.inputs.values()):
+            raise ValueError("MuSig2 contexts are required")
         self.phase = btc.BTCMuSig2Init.NONCE
         self.session_id = b""
-        self.nonces: Dict[int, btc.BTCMuSig2NoncesRequest] = {}
-        self.results: Dict[int, btc.BTCMuSig2Result] = {}
+        self.nonces: Dict[Tuple[int, int], btc.BTCMuSig2NoncesRequest] = {}
+        self.results: Dict[Tuple[int, int], btc.BTCMuSig2Result] = {}
 
-    def begin_sign(self, nonces: Dict[int, btc.BTCMuSig2NoncesRequest]) -> None:
+    def contexts(self) -> Set[Tuple[int, int]]:
+        """Every (input index, context position) of the session."""
+        return {
+            (index, position)
+            for index, contexts in self.inputs.items()
+            for position in range(len(contexts))
+        }
+
+    def _set_nonces(self, nonces: Dict[MuSig2Key, btc.BTCMuSig2NoncesRequest]) -> None:
+        normalized = {_musig2_key(key): request for key, request in nonces.items()}
+        if set(normalized) != self.contexts():
+            raise ValueError("Invalid MuSig2 nonce set")
+        self.nonces = normalized
+
+    def begin_sign(self, nonces: Dict[MuSig2Key, btc.BTCMuSig2NoncesRequest]) -> None:
         """Select signing after collecting every participant's BIP373 nonce."""
-        if len(self.session_id) != 32 or set(self.results) != set(self.inputs):
+        if len(self.session_id) != 32 or set(self.results) != self.contexts():
             raise ValueError("Complete the nonce round first")
-        if self.phase != btc.BTCMuSig2Init.NONCE or set(nonces) != set(self.inputs):
-            raise ValueError("Invalid MuSig2 nonce set or phase")
+        if self.phase != btc.BTCMuSig2Init.NONCE:
+            raise ValueError("Invalid MuSig2 phase")
+        self._set_nonces(nonces)
         self.phase = btc.BTCMuSig2Init.SIGN
-        self.nonces = nonces
         self.results = {}
 
-    def begin_nonce_and_sign(self, nonces: Dict[int, btc.BTCMuSig2NoncesRequest]) -> None:
+    def begin_nonce_and_sign(self, nonces: Dict[MuSig2Key, btc.BTCMuSig2NoncesRequest]) -> None:
         """Contribute last: nonces holds every other participant's BIP373 nonce."""
         if self.phase != btc.BTCMuSig2Init.NONCE or self.session_id or self.results:
             raise ValueError("A MuSig2 round was already started")
-        if set(nonces) != set(self.inputs):
-            raise ValueError("Invalid MuSig2 nonce set")
+        self._set_nonces(nonces)
         self.phase = btc.BTCMuSig2Init.NONCE_AND_SIGN
-        self.nonces = nonces
+
+    def expected_results(self) -> Set[Tuple[int, int]]:
+        """The contexts the current round contributes to."""
+        return {
+            key for key in self.contexts() if key not in self.nonces or not self.nonces[key].skip
+        }
 
     def collect(self, result: btc.BTCMuSig2Result) -> None:
         """Check response routing before exposing a contribution to the PSBT."""
         index = result.input_index
-        if index not in self.inputs or index in self.results:
+        positions = [
+            position
+            for position, context in enumerate(self.inputs.get(index, []))
+            if result.context_key == context.context_key
+            and result.HasField("tapleaf_hash") == context.HasField("tapleaf_hash")
+            and result.tapleaf_hash == context.tapleaf_hash
+        ]
+        if len(positions) != 1:
+            raise ValueError("MuSig2 result does not match its PSBT context")
+        key = (index, positions[0])
+        if key not in self.expected_results() or key in self.results:
             raise ValueError("Unexpected or duplicate MuSig2 result")
-        context = self.inputs[index]
+        context = self.inputs[index][positions[0]]
         nonce_size = 66 if self.phase != btc.BTCMuSig2Init.SIGN else 0
         signature_size = 32 if self.phase != btc.BTCMuSig2Init.NONCE else 0
         if (
-            result.context_key != context.context_key
-            or result.HasField("tapleaf_hash") != context.HasField("tapleaf_hash")
-            or result.tapleaf_hash != context.tapleaf_hash
-            or result.participant_pubkey not in context.participant_pubkeys
+            result.participant_pubkey not in context.participant_pubkeys
             or len(result.public_nonce) != nonce_size
             or len(result.partial_signature) != signature_size
         ):
             raise ValueError("MuSig2 result does not match its PSBT context")
-        self.results[index] = result
+        self.results[key] = result
 
 
 class BTCOutputInternal:
@@ -618,10 +663,10 @@ class BitBox02(BitBoxCommonAPI):
 
         is_inputs_pass2 = False
         while True:
-            if next_response.HasField("musig2_result"):
+            for result in next_response.musig2_results:
                 if musig2 is None:
                     raise ValueError("Unexpected MuSig2 contribution")
-                musig2.collect(next_response.musig2_result)
+                musig2.collect(result)
             if next_response.type == btc.BTCSignNextResponse.INPUT:
                 input_index = next_response.index
                 tx_input = inputs[input_index]
@@ -635,15 +680,13 @@ class BitBox02(BitBoxCommonAPI):
                         sequence=tx_input["sequence"],
                         keypath=tx_input["keypath"],
                         script_config_index=tx_input["script_config_index"],
-                        musig2=musig2.inputs.get(input_index) if musig2 is not None else None,
+                        musig2=musig2.inputs.get(input_index, []) if musig2 is not None else [],
                     )
                 )
 
                 # Anti-Klepto protocol not supported yet for Schnorr signatures.
                 input_is_schnorr = is_taproot(script_configs[tx_input["script_config_index"]])
-                perform_antiklepto = (
-                    is_inputs_pass2 and not input_is_schnorr and not nonce_round
-                )
+                perform_antiklepto = is_inputs_pass2 and not input_is_schnorr and not nonce_round
 
                 if perform_antiklepto:
                     host_nonce = os.urandom(32)
@@ -768,13 +811,16 @@ class BitBox02(BitBoxCommonAPI):
                 if musig2 is None or nonce_round:
                     raise ValueError("Unexpected MuSig2 nonce request")
                 btc_request = btc.BTCRequest()
-                btc_request.musig2_nonces.CopyFrom(musig2.nonces[next_response.index])
+                key = (next_response.index, next_response.musig2_index)
+                if key not in musig2.nonces:
+                    raise ValueError("Unexpected MuSig2 nonce request")
+                btc_request.musig2_nonces.CopyFrom(musig2.nonces[key])
                 next_response = self._btc_msg_query(
                     btc_request, expected_response="sign_next"
                 ).sign_next
             elif next_response.type == btc.BTCSignNextResponse.DONE:
                 if musig2 is not None and (
-                    set(musig2.results) != set(musig2.inputs)
+                    set(musig2.results) != musig2.expected_results()
                     or next_response.musig2_session_id != musig2.session_id
                 ):
                     raise ValueError("Incomplete MuSig2 round")
