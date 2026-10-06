@@ -6,6 +6,10 @@ recorded separately.
 
 ## Firmware
 
+### v9.29.0
+- Bitcoin: sign MuSig2 (BIP-327) inputs of Taproot wallet policies containing `musig()` keys, including single-round signing when the device is the last participant to contribute a nonce
+- Bitcoin: allow exporting Taproot multisig xpubs at m/48'/coin'/account'/3' without warning
+
 ### Unreleased
 - Allow entering the optional BIP39 passphrase on the host, with device approval and confirmation
 - Reject malformed microSD backups instead of crashing
