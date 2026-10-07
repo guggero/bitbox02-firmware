@@ -623,7 +623,7 @@ class BitBox02(BitBoxCommonAPI):
             self._require_atleast(semver.VersionInfo(9, 24, 0))
 
         if musig2 is not None:
-            if bip322_message is not None or musig2.results:
+            if musig2.results:
                 raise ValueError("Invalid or already completed MuSig2 round")
             if any(index < 0 or index >= len(inputs) for index in musig2.inputs):
                 raise ValueError("MuSig2 input index out of range")

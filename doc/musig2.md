@@ -35,8 +35,13 @@ contexts in a session, at most 128 total inputs in a MuSig session, and the
 existing policy limit of 20 keys. Ordinary simple-script and policy inputs can share a MuSig
 transaction. Only SIGHASH_DEFAULT is supported for Taproot. Raw aggregate-key
 wallets, custom aggregate chain codes, two contexts for the same aggregate and
-leaf of one input, legacy multisig configs mixed into this mode, BIP322, and silent-payment outputs
+leaf of one input, legacy multisig configs mixed into this mode, and silent-payment outputs
 are not supported in MuSig mode.
+
+BIP-322 message signing and proofs of funds (`bip322_message` set in the init
+request) work in MuSig mode too: the `to_sign` transaction is streamed like any
+other, the message is reviewed instead of a transaction in every round, and its
+MuSig inputs are signed with the regular BIP-341 sighash of `to_sign`.
 
 ## Wire exchange
 

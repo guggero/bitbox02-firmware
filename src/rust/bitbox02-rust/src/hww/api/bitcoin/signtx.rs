@@ -1026,6 +1026,9 @@ async fn sign_musig2_input(
 /// SIGHASH_DEFAULT) makes every signature commit to all prevouts, including the `to_spend` outpoint
 /// of the first input, whose transaction can never be mined. This is what keeps the signatures of
 /// the proof-of-funds inputs from being usable in a transaction that spends the coins.
+///
+/// Inputs of Taproot wallet policies with `musig()` keys are signed in a MuSig2 round, exactly as
+/// in a transaction: the same message is reviewed in every round of a session.
 #[allow(clippy::too_many_arguments)]
 async fn process_bip322(
     hal: &mut impl crate::hal::Hal,
@@ -1036,8 +1039,13 @@ async fn process_bip322(
     validated_script_configs: &[ValidatedScriptConfigWithKeypath<'_>],
     mut xpub_cache: Bip32XpubCache,
     mut next_response: NextResponse,
+    mut musig_round: Option<musig2::Round>,
 ) -> Result<Response, Error> {
     bip322::validate_init(request)?;
+
+    if let Some(round) = &musig_round {
+        next_response.next.musig2_session_id = round.session_id().to_vec();
+    }
 
     let coin_params = super::params::get(coin);
 
@@ -1069,9 +1077,6 @@ async fn process_bip322(
         }
 
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
-        if !tx_input.musig2.is_empty() {
-            return Err(Error::InvalidInput);
-        }
         let script_config_account = validated_script_configs
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
@@ -1081,6 +1086,14 @@ async fn process_bip322(
             &tx_input.keypath,
             keypath::ReceiveSpend::Spend,
         )?;
+        if let Some(round) = musig_round.as_mut() {
+            round.input(&tx_input)?;
+            for metadata in &tx_input.musig2 {
+                musig2::context(&script_config_account.config, &tx_input, metadata)?;
+            }
+        } else if !tx_input.musig2.is_empty() {
+            return Err(Error::InvalidInput);
+        }
 
         let payload = common::Payload::from(
             hal,
@@ -1126,6 +1139,9 @@ async fn process_bip322(
     // scriptPubKey `OP_RETURN`.
     let tx_output = get_tx_output(0, &mut next_response).await?;
     bip322::validate_output(&tx_output)?;
+    if let Some(round) = musig_round.as_mut() {
+        round.output(&tx_output);
+    }
     drop(progress_component.take());
     let mut hasher_outputs = Sha256::new();
     hasher_outputs.update(0u64.to_le_bytes());
@@ -1181,17 +1197,20 @@ async fn process_bip322(
     }
 
     verify_message::verify(hal, "Sign message", "Sign", message, true).await?;
+    if let Some(round) = musig_round.as_mut() {
+        round.approve()?;
+    }
 
     // Sign the inputs (second pass).
     let mut proven_sum_pass2: u64 = 0;
     for input_index in 0..request.num_inputs {
         let tx_input = get_tx_input(input_index, &mut next_response).await?;
-        if !tx_input.musig2.is_empty() {
-            return Err(Error::InvalidInput);
-        }
         let script_config_account = validated_script_configs
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
+        if let Some(round) = musig_round.as_ref() {
+            round.check_input(input_index, &tx_input)?;
+        }
 
         if input_index == 0 {
             validate_keypath(
@@ -1220,23 +1239,46 @@ async fn process_bip322(
             }
         }
 
-        sign_input(
-            hal,
-            &mut xpub_cache,
-            request,
-            &tx_hashes,
-            input_index,
-            &tx_input,
-            script_config_account,
-            &mut next_response,
-        )
-        .await?;
+        if !tx_input.musig2.is_empty() {
+            let round = musig_round.as_mut().ok_or(Error::InvalidInput)?;
+            sign_musig2_input(
+                hal,
+                round,
+                request,
+                &tx_hashes,
+                input_index,
+                &tx_input,
+                script_config_account,
+                &mut next_response,
+            )
+            .await?;
+        } else if musig_round
+            .as_ref()
+            .is_some_and(|round| round.mode == musig2::Mode::Nonce)
+        {
+            // As in a transaction, the nonce round produces no ordinary signatures.
+        } else {
+            sign_input(
+                hal,
+                &mut xpub_cache,
+                request,
+                &tx_hashes,
+                input_index,
+                &tx_input,
+                script_config_account,
+                &mut next_response,
+            )
+            .await?;
+        }
     }
 
     if proven_sum_pass1 != proven_sum_pass2 {
         return Err(Error::InvalidInput);
     }
 
+    if let Some(round) = musig_round {
+        next_response.next.musig2_session_id = round.finish()?.to_vec();
+    }
     next_response.next.r#type = NextType::Done as _;
     Ok(next_response.to_protobuf())
 }
@@ -1348,6 +1390,7 @@ async fn _process(
             &validated_script_configs,
             xpub_cache,
             next_response,
+            musig_round,
         ))
         .await;
     }

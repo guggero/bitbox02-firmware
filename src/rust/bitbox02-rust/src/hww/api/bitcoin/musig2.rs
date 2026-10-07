@@ -135,7 +135,6 @@ impl Round {
         };
         if request.num_inputs == 0
             || request.num_inputs as usize > MAX_INPUTS
-            || request.bip322_message.is_some()
             || request.contains_silent_payment_outputs
         {
             return Err(Error::InvalidInput);
@@ -738,9 +737,6 @@ mod tests {
         // A dropped nonce round leaves no pending storage, even before approval.
         assert!(PENDING.0.borrow().is_none());
         request.contains_silent_payment_outputs = true;
-        assert!(Round::begin(&mut hal, &request).await.is_err());
-        request.contains_silent_payment_outputs = false;
-        request.bip322_message = Some(vec![]);
         assert!(Round::begin(&mut hal, &request).await.is_err());
     }
 
