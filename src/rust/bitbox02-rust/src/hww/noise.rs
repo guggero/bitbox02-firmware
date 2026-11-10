@@ -65,6 +65,8 @@ pub(crate) async fn process(
 ) -> Result<(), Error> {
     match usb_in.split_first() {
         Some((&OP_I_CAN_HAS_HANDSHAEK, b"")) => {
+            #[cfg(feature = "app-bitcoin")]
+            crate::hww::api::bitcoin::musig2::clear();
             // Pairing is the start of a session, so we clean the screen stack in case
             // we started a new session in the middle of something.
             hal.ui().reset();

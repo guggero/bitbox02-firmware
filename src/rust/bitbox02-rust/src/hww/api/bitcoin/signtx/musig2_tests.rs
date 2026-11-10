@@ -1,0 +1,732 @@
+// SPDX-License-Identifier: Apache-2.0
+
+use super::super::policies;
+use super::*;
+use crate::hal::testing::ui::Screen;
+use crate::hal::{Memory, testing::TestingHal};
+use alloc::{boxed::Box, rc::Rc};
+use bitbox_secp256k1::musig::{SecretNonce, verify_partial};
+use bitcoin::bip32::{Xpriv, Xpub};
+use bitcoin::sighash::{Prevouts, SighashCache, TapSighashType};
+use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness};
+use core::cell::RefCell;
+use pb::btc_mu_sig2_init::Phase;
+use util::bip32::HARDENED;
+
+struct Fixture {
+    init: pb::BtcSignInitRequest,
+    inputs: Vec<pb::BtcSignInputRequest>,
+    output: pb::BtcSignOutputRequest,
+    prevouts: Vec<TxOut>,
+    contexts: Vec<policies::musig::SigningContext>,
+    messages: Vec<[u8; 32]>,
+    other_secret: [u8; 32],
+}
+
+/// A registered MuSig wallet policy and the aggregate the fixture signs for.
+struct Wallet {
+    policy: &'static str,
+    /// Key expression of the aggregate to sign with, always containing our @0.
+    expression: &'static str,
+    /// Index of the other participant of `expression`.
+    other: usize,
+    /// Number of keys in the policy. @0 is ours, the others are bare xpubs.
+    num_keys: usize,
+}
+
+const KEY_PATH_WALLET: Wallet = Wallet {
+    policy: "tr(musig(@0,@1)/**)",
+    expression: "musig(@0,@1)/**",
+    other: 1,
+    num_keys: 2,
+};
+
+const LEAF_WALLET: Wallet = Wallet {
+    policy: "tr(@0/<2;3>/*,pk(musig(@0,@1)/**))",
+    expression: "musig(@0,@1)/**",
+    other: 1,
+    num_keys: 2,
+};
+
+async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
+    fixture_for(hal, if leaf { &LEAF_WALLET } else { &KEY_PATH_WALLET }).await
+}
+
+async fn fixture_for(hal: &mut TestingHal<'_>, wallet: &Wallet) -> Fixture {
+    crate::keystore::testing::mock_unlocked();
+    musig2::clear();
+    let origin = vec![48 + HARDENED, 1 + HARDENED, HARDENED, 3 + HARDENED];
+    let our_key = pb::KeyOriginInfo {
+        root_fingerprint: crate::keystore::root_fingerprint().unwrap(),
+        keypath: origin.clone(),
+        xpub: Some(
+            crate::keystore::get_xpub(hal, &origin, Compute::Once)
+                .await
+                .unwrap()
+                .into(),
+        ),
+    };
+    let others: Vec<_> = (1..wallet.num_keys)
+        .map(|i| Xpriv::new_master(bitcoin::NetworkKind::Test, &[16 + i as u8; 32]).unwrap())
+        .collect();
+    let other = others[wallet.other - 1];
+    let mut keys = vec![our_key];
+    keys.extend(others.iter().map(|other| pb::KeyOriginInfo {
+        xpub: Some(crate::bip32::Xpub::from(Xpub::from_priv(SECP256K1, other)).into()),
+        ..Default::default()
+    }));
+    let policy = pb::btc_script_config::Policy {
+        policy: wallet.policy.into(),
+        keys,
+    };
+    let hash = policies::get_hash(pb::BtcCoin::Tbtc, &policy).unwrap();
+    hal.memory
+        .multisig_set_by_hash(&hash, "MuSig wallet")
+        .unwrap();
+    let parsed = policies::parse(hal, &policy, pb::BtcCoin::Tbtc)
+        .await
+        .unwrap();
+    let mut inputs = Vec::new();
+    let mut contexts = Vec::new();
+    let mut prevouts = Vec::new();
+    // Two inputs exercise piggybacked results and the same participant key with
+    // distinct nonces. The second input chooses a different aggregate child.
+    for index in 0..2 {
+        let selector: Vec<_> = origin.iter().copied().chain([0, index]).collect();
+        let context = parsed.musig_context(wallet.expression, &selector).unwrap();
+        let policies::Descriptor::Tr(tr) = parsed.derive_at_keypath(&selector).unwrap() else {
+            panic!()
+        };
+        let script =
+            ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
+                bitcoin::secp256k1::XOnlyPublicKey::from_slice(&tr.output_key()).unwrap(),
+            ));
+        prevouts.push(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script,
+        });
+        inputs.push(pb::BtcSignInputRequest {
+            prev_out_hash: vec![1 + index as u8; 32],
+            prev_out_index: 0,
+            prev_out_value: 100_000,
+            sequence: 0xffffffff,
+            keypath: selector,
+            musig2: vec![pb::BtcMuSig2Input {
+                key_expression: wallet.expression.into(),
+                aggregate_key: context.bare_key.to_vec(),
+                participant_pubkeys: context
+                    .participants
+                    .iter()
+                    .map(|key| key.to_vec())
+                    .collect(),
+                context_key: context.aggregate.public_key().serialize().to_vec(),
+                tapleaf_hash: context.tapleaf_hash.map(|hash| hash.to_vec()),
+            }],
+            ..Default::default()
+        });
+        contexts.push(context);
+    }
+    let output = pb::BtcSignOutputRequest {
+        r#type: pb::BtcOutputType::P2wpkh as _,
+        value: 195_000,
+        payload: vec![5; 20],
+        ..Default::default()
+    };
+    let transaction = Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: inputs
+            .iter()
+            .map(|input| TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_slice(&input.prev_out_hash).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::from_sat(output.value),
+            script_pubkey: ScriptBuf::new_p2wpkh(
+                &bitcoin::WPubkeyHash::from_slice(&output.payload).unwrap(),
+            ),
+        }],
+    };
+    let messages = sighashes(&transaction, &prevouts, &contexts);
+    let init = pb::BtcSignInitRequest {
+        coin: pb::BtcCoin::Tbtc as _,
+        version: 2,
+        num_inputs: 2,
+        num_outputs: 1,
+        script_configs: vec![pb::BtcScriptConfigWithKeypath {
+            keypath: origin,
+            script_config: Some(pb::BtcScriptConfig {
+                config: Some(pb::btc_script_config::Config::Policy(policy)),
+            }),
+        }],
+        musig2: Some(pb::BtcMuSig2Init {
+            phase: Phase::Nonce as _,
+            session_id: vec![],
+        }),
+        ..Default::default()
+    };
+    Fixture {
+        init,
+        inputs,
+        output,
+        prevouts,
+        contexts,
+        messages,
+        other_secret: other.private_key.secret_bytes(),
+    }
+}
+
+/// The BIP-341 sighash every input signs with its context.
+fn sighashes(
+    transaction: &Transaction,
+    prevouts: &[TxOut],
+    contexts: &[policies::musig::SigningContext],
+) -> Vec<[u8; 32]> {
+    let mut sighash = SighashCache::new(transaction);
+    contexts
+        .iter()
+        .enumerate()
+        .map(|(index, context)| {
+            let hash = match context.tapleaf_hash {
+                Some(hash) => sighash.taproot_script_spend_signature_hash(
+                    index,
+                    &Prevouts::All(prevouts),
+                    bitcoin::TapLeafHash::from_byte_array(hash),
+                    TapSighashType::Default,
+                ),
+                None => sighash.taproot_key_spend_signature_hash(
+                    index,
+                    &Prevouts::All(prevouts),
+                    TapSighashType::Default,
+                ),
+            }
+            .unwrap();
+            hash.to_byte_array()
+        })
+        .collect()
+}
+
+fn next(response: Response) -> pb::BtcSignNextResponse {
+    match response {
+        Response::BtcSignNext(next) => next,
+        Response::Btc(pb::BtcResponse {
+            response: Some(pb::btc_response::Response::SignNext(next)),
+        }) => next,
+        _ => panic!("unexpected response"),
+    }
+}
+
+/// Streams the transaction of the fixture in a round. Returns the MuSig2 contributions, the
+/// session ID and the number of ordinary signatures.
+async fn run_with_signatures(
+    hal: &mut TestingHal<'_>,
+    fixture: &Fixture,
+    nonces: Vec<pb::BtcMuSig2NoncesRequest>,
+    mutate_pass_two: bool,
+) -> Result<(Vec<pb::BtcMuSig2Result>, Vec<u8>, usize), Error> {
+    let inputs = fixture.inputs.clone();
+    let output = fixture.output.clone();
+    let results = Rc::new(RefCell::new(Vec::new()));
+    let observed = results.clone();
+    let num_signatures = Rc::new(RefCell::new(0));
+    let observed_signatures = num_signatures.clone();
+    let counts = RefCell::new([0; 2]);
+    *crate::hww::MOCK_NEXT_REQUEST.0.borrow_mut() = Some(Box::new(move |response| {
+        let next = next(response);
+        *observed_signatures.borrow_mut() += usize::from(next.has_signature);
+        observed.borrow_mut().extend(next.musig2_results);
+        Ok(match NextType::try_from(next.r#type).unwrap() {
+            NextType::Input => {
+                let i = next.index as usize;
+                counts.borrow_mut()[i] += 1;
+                let mut input = inputs[i].clone();
+                if mutate_pass_two && counts.borrow()[i] == 2 {
+                    input.prev_out_value += 1;
+                }
+                Request::BtcSignInput(input)
+            }
+            NextType::Output => Request::BtcSignOutput(output.clone()),
+            NextType::Musig2Nonces => {
+                // The requests for an input's contexts, in their order. Tests passing
+                // requests for other inputs fall back to the position of the input.
+                let request = nonces
+                    .iter()
+                    .filter(|request| request.input_index == next.index)
+                    .nth(next.musig2_index as usize)
+                    .unwrap_or(&nonces[next.index as usize])
+                    .clone();
+                Request::Btc(pb::BtcRequest {
+                    request: Some(pb::btc_request::Request::Musig2Nonces(request)),
+                })
+            }
+            _ => panic!("unexpected next type"),
+        })
+    }));
+    let last = next(process(hal, &fixture.init).await?);
+    assert_eq!(last.r#type, NextType::Done as i32);
+    *num_signatures.borrow_mut() += usize::from(last.has_signature);
+    results.borrow_mut().extend(last.musig2_results);
+    let results = results.borrow().clone();
+    let num_signatures = *num_signatures.borrow();
+    Ok((results, last.musig2_session_id, num_signatures))
+}
+
+/// Like `run_with_signatures`, for a transaction of MuSig2 inputs only.
+async fn run(
+    hal: &mut TestingHal<'_>,
+    fixture: &Fixture,
+    nonces: Vec<pb::BtcMuSig2NoncesRequest>,
+    mutate_pass_two: bool,
+) -> Result<(Vec<pb::BtcMuSig2Result>, Vec<u8>), Error> {
+    let (results, id, num_signatures) =
+        run_with_signatures(hal, fixture, nonces, mutate_pass_two).await?;
+    assert_eq!(num_signatures, 0);
+    Ok((results, id))
+}
+
+/// A nonce of the other participant for the context of every input, and the nonces requests with
+/// the nonces of every participant except us.
+fn peer_nonces(fixture: &Fixture) -> (Vec<SecretNonce>, Vec<pb::BtcMuSig2NoncesRequest>) {
+    let mut peers = Vec::new();
+    let mut requests = Vec::new();
+    for (i, ctx) in fixture.contexts.iter().enumerate() {
+        let peer = SecretNonce::generate(
+            &mut [30 + i as u8; 32],
+            &fixture.other_secret,
+            &ctx.aggregate,
+            &fixture.messages[i],
+            &[9; 32],
+        )
+        .unwrap();
+        let metadata = &fixture.inputs[i].musig2[0];
+        requests.push(pb::BtcMuSig2NoncesRequest {
+            input_index: i as _,
+            skip: false,
+            context_key: metadata.context_key.clone(),
+            tapleaf_hash: metadata.tapleaf_hash.clone(),
+            nonces: ctx
+                .participants
+                .iter()
+                .filter(|key| **key != ctx.participant)
+                .map(|key| pb::BtcMuSig2Nonce {
+                    participant_pubkey: key.to_vec(),
+                    public_nonce: peer.public_nonce().to_vec(),
+                })
+                .collect(),
+        });
+        peers.push(peer);
+    }
+    (peers, requests)
+}
+
+/// The nonces requests of the signing round after the nonce round returned `public`, with a
+/// fresh nonce of the other participant for every context, and the nonces of every context in
+/// the order of its participants.
+fn signing_requests(
+    fixture: &Fixture,
+    public: &[pb::BtcMuSig2Result],
+) -> (Vec<pb::BtcMuSig2NoncesRequest>, Vec<Vec<[u8; 66]>>) {
+    let mut requests = Vec::new();
+    let mut ordered = Vec::new();
+    for (i, ctx) in fixture.contexts.iter().enumerate() {
+        let other = SecretNonce::generate(
+            &mut [40 + i as u8; 32],
+            &fixture.other_secret,
+            &ctx.aggregate,
+            &fixture.messages[i],
+            &[11; 32],
+        )
+        .unwrap();
+        let nonces: Vec<[u8; 66]> = ctx
+            .participants
+            .iter()
+            .map(|key| {
+                if key == &ctx.participant {
+                    public[i].public_nonce.as_slice().try_into().unwrap()
+                } else {
+                    other.public_nonce()
+                }
+            })
+            .collect();
+        requests.push(pb::BtcMuSig2NoncesRequest {
+            input_index: i as _,
+            skip: false,
+            context_key: public[i].context_key.clone(),
+            tapleaf_hash: public[i].tapleaf_hash.clone(),
+            nonces: ctx
+                .participants
+                .iter()
+                .zip(&nonces)
+                .map(|(key, nonce)| pb::BtcMuSig2Nonce {
+                    participant_pubkey: key.to_vec(),
+                    public_nonce: nonce.to_vec(),
+                })
+                .collect(),
+        });
+        ordered.push(nonces);
+    }
+    (requests, ordered)
+}
+
+/// Verify our partial signature of the context of input `index` against the nonces of the
+/// session in the order of the participants.
+fn verify_partial_of(fixture: &Fixture, index: usize, nonces: &[[u8; 66]], sig: &[u8]) {
+    let ctx = &fixture.contexts[index];
+    let signer = ctx
+        .participants
+        .iter()
+        .position(|key| key == &ctx.participant)
+        .unwrap();
+    verify_partial(
+        &ctx.aggregate,
+        nonces,
+        &fixture.messages[index],
+        signer,
+        sig.try_into().unwrap(),
+    )
+    .unwrap();
+}
+
+#[async_test::test]
+async fn test_musig2_signtx() {
+    for leaf in [false, true] {
+        let mut hal = TestingHal::new();
+        let mut fixture = fixture(&mut hal, leaf).await;
+        let (public, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+        assert_eq!(public.len(), 2);
+        assert_eq!(id.len(), 32);
+        let mut requests = Vec::new();
+        let mut ordered = Vec::new();
+        for (i, result) in public.iter().enumerate() {
+            let ctx = &fixture.contexts[i];
+            assert_eq!(result.input_index, i as u32);
+            let ours = &result.public_nonce;
+            assert_eq!(ours.len(), 66);
+            assert!(result.partial_signature.is_empty());
+            let other = SecretNonce::generate(
+                &mut [20 + i as u8; 32],
+                &fixture.other_secret,
+                &ctx.aggregate,
+                &fixture.messages[i],
+                &[7; 32],
+            )
+            .unwrap();
+            let nonces: Vec<[u8; 66]> = ctx
+                .participants
+                .iter()
+                .map(|key| {
+                    if key == &ctx.participant {
+                        ours.as_slice().try_into().unwrap()
+                    } else {
+                        other.public_nonce()
+                    }
+                })
+                .collect();
+            // BIP373 is a map; nonce record order need not equal aggregation order.
+            let mut records: Vec<_> = ctx
+                .participants
+                .iter()
+                .zip(&nonces)
+                .map(|(key, nonce)| pb::BtcMuSig2Nonce {
+                    participant_pubkey: key.to_vec(),
+                    public_nonce: nonce.to_vec(),
+                })
+                .collect();
+            records.reverse();
+            requests.push(pb::BtcMuSig2NoncesRequest {
+                input_index: i as _,
+                skip: false,
+                context_key: public[i].context_key.clone(),
+                tapleaf_hash: public[i].tapleaf_hash.clone(),
+                nonces: records,
+            });
+            // The other participant can sign with our nonce.
+            other
+                .sign(
+                    &fixture.other_secret,
+                    &ctx.aggregate,
+                    &nonces,
+                    &fixture.messages[i],
+                )
+                .unwrap();
+            ordered.push(nonces);
+        }
+        fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+            phase: Phase::Sign as _,
+            session_id: id,
+        });
+        let (partials, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+        assert_eq!(partials.len(), 2);
+        for i in 0..2 {
+            let ctx = &fixture.contexts[i];
+            let sig = &partials[i].partial_signature;
+            assert!(partials[i].public_nonce.is_empty());
+            assert_eq!(partials[i].input_index, i as u32);
+            assert_eq!(partials[i].context_key, public[i].context_key);
+            let signer = ctx
+                .participants
+                .iter()
+                .position(|key| key == &ctx.participant)
+                .unwrap();
+            verify_partial(
+                &ctx.aggregate,
+                &ordered[i],
+                &fixture.messages[i],
+                signer,
+                sig.as_slice().try_into().unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            process(&mut hal, &fixture.init).await,
+            Err(Error::InvalidState)
+        );
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_rejects_changes() {
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture(&mut hal, false).await;
+    let (_, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    assert_eq!(
+        run(&mut hal, &fixture, vec![], true).await,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        process(&mut hal, &fixture.init).await,
+        Err(Error::InvalidState)
+    );
+
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Nonce as _,
+        session_id: vec![],
+    });
+    let (_, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    fixture.output.value -= 1;
+    assert_eq!(
+        run(&mut hal, &fixture, vec![], false).await,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        process(&mut hal, &fixture.init).await,
+        Err(Error::InvalidState)
+    );
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_user_abort() {
+    for signing in [false, true] {
+        let mut hal = TestingHal::new();
+        let mut fixture = fixture(&mut hal, false).await;
+        if signing {
+            let (_, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+            fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+                phase: Phase::Sign as _,
+                session_id: id,
+            });
+        }
+        // Reject the first authorization in this round. Signing takes ownership
+        // before the UI, so an aborted second round cannot be resumed.
+        hal.ui = crate::hal::testing::ui::TestingUi::new();
+        hal.ui.abort_nth(0);
+        assert_eq!(
+            run(&mut hal, &fixture, vec![], false).await,
+            Err(Error::UserAbort)
+        );
+        if signing {
+            assert_eq!(
+                process(&mut hal, &fixture.init).await,
+                Err(Error::InvalidState)
+            );
+        } else {
+            hal.ui = crate::hal::testing::ui::TestingUi::new();
+            run(&mut hal, &fixture, vec![], false).await.unwrap();
+            musig2::clear();
+        }
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_ordinary_input() {
+    // An input spent with our ordinary key of the policy is signed in the signing round, next to
+    // the contribution to the MuSig2 context of the other input.
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture(&mut hal, true).await;
+    let ordinary = &mut fixture.inputs[1];
+    let branch = ordinary.keypath.len() - 2;
+    ordinary.keypath[branch] = 2;
+    ordinary.musig2.clear();
+    fixture.contexts.truncate(1);
+
+    let (public, id, num_signatures) = run_with_signatures(&mut hal, &fixture, vec![], false)
+        .await
+        .unwrap();
+    assert_eq!(public.len(), 1);
+    assert_eq!(num_signatures, 0);
+
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    let (requests, _) = signing_requests(&fixture, &public);
+    let (partials, _, num_signatures) = run_with_signatures(&mut hal, &fixture, requests, false)
+        .await
+        .unwrap();
+    assert_eq!(partials.len(), 1);
+    assert_eq!(partials[0].partial_signature.len(), 32);
+    assert_eq!(num_signatures, 1);
+}
+
+/// The 2-of-3 policy our key is part of two aggregates of, the key path with @1
+/// and a leaf with @2, as the fixtures of both aggregates. Every input of the
+/// first carries both contexts, the key path one first.
+async fn two_context_fixtures(hal: &mut TestingHal<'_>) -> (Fixture, Fixture) {
+    const POLICY: &str = "tr(musig(@0,@1)/**,{pk(musig(@0,@2)/**),pk(musig(@1,@2)/**)})";
+    let leaf = fixture_for(
+        hal,
+        &Wallet {
+            policy: POLICY,
+            expression: "musig(@0,@2)/**",
+            other: 2,
+            num_keys: 3,
+        },
+    )
+    .await;
+    let mut key_path = fixture_for(
+        hal,
+        &Wallet {
+            policy: POLICY,
+            expression: "musig(@0,@1)/**",
+            other: 1,
+            num_keys: 3,
+        },
+    )
+    .await;
+    for (input, leaf_input) in key_path.inputs.iter_mut().zip(&leaf.inputs) {
+        assert_eq!(input.prev_out_hash, leaf_input.prev_out_hash);
+        input.musig2.push(leaf_input.musig2[0].clone());
+    }
+    (key_path, leaf)
+}
+
+/// A skip answer to the nonces request for the context of the input.
+fn skip(index: usize, metadata: &pb::BtcMuSig2Input) -> pb::BtcMuSig2NoncesRequest {
+    pb::BtcMuSig2NoncesRequest {
+        input_index: index as _,
+        context_key: metadata.context_key.clone(),
+        tapleaf_hash: metadata.tapleaf_hash.clone(),
+        skip: true,
+        ..Default::default()
+    }
+}
+
+/// Verify our partial signature of a context with the given nonces of ours and
+/// the peer.
+fn verify_ours(fixture: &Fixture, index: usize, ours: &[u8], peer: &[u8; 66], sig: &[u8]) {
+    let ctx = &fixture.contexts[index];
+    let nonces: Vec<[u8; 66]> = ctx
+        .participants
+        .iter()
+        .map(|key| {
+            if key == &ctx.participant {
+                ours.try_into().unwrap()
+            } else {
+                *peer
+            }
+        })
+        .collect();
+    let signer = ctx
+        .participants
+        .iter()
+        .position(|key| key == &ctx.participant)
+        .unwrap();
+    verify_partial(
+        &ctx.aggregate,
+        &nonces,
+        &fixture.messages[index],
+        signer,
+        sig.try_into().unwrap(),
+    )
+    .unwrap();
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_several_contexts() {
+    // The nonce round contributes to every context of an input, the signing round
+    // only to those the host can complete. The other's secret nonce is destroyed.
+    let mut hal = TestingHal::new();
+    let (mut fixture, _) = two_context_fixtures(&mut hal).await;
+    let (public, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+    assert_eq!(public.len(), 4);
+    for (result, (index, position)) in public.iter().zip([(0, 0), (0, 1), (1, 0), (1, 1)]) {
+        assert_eq!(result.input_index, index as u32);
+        let metadata = &fixture.inputs[index].musig2[position];
+        assert_eq!(result.context_key, metadata.context_key);
+        assert_eq!(result.tapleaf_hash, metadata.tapleaf_hash);
+        assert_eq!(result.public_nonce.len(), 66);
+    }
+
+    let (peers, mut key_path) = peer_nonces(&fixture);
+    let mut requests = Vec::new();
+    for (index, request) in key_path.iter_mut().enumerate() {
+        let ours = &public[2 * index].public_nonce;
+        request.nonces.push(pb::BtcMuSig2Nonce {
+            participant_pubkey: fixture.contexts[index].participant.to_vec(),
+            public_nonce: ours.clone(),
+        });
+        requests.push(request.clone());
+        requests.push(skip(index, &fixture.inputs[index].musig2[1]));
+    }
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    let (partials, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+    assert_eq!(partials.len(), 2);
+    for (index, partial) in partials.iter().enumerate() {
+        assert_eq!(partial.input_index, index as u32);
+        assert!(partial.tapleaf_hash.is_none());
+        verify_ours(
+            &fixture,
+            index,
+            &public[2 * index].public_nonce,
+            &peers[index].public_nonce(),
+            &partial.partial_signature,
+        );
+    }
+
+    // The session is gone, including the skipped nonces.
+    assert_eq!(
+        process(&mut hal, &fixture.init).await,
+        Err(Error::InvalidState)
+    );
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_rejects_duplicate_contexts() {
+    // A context must not be listed twice, which would contribute twice to it.
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture(&mut hal, false).await;
+    let duplicate = fixture.inputs[1].musig2[0].clone();
+    fixture.inputs[1].musig2.push(duplicate);
+    assert_eq!(
+        run(&mut hal, &fixture, vec![], false).await,
+        Err(Error::InvalidInput)
+    );
+}

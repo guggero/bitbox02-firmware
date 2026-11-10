@@ -18,6 +18,7 @@ recorded separately.
 - Bitcoin: sign BIP-322 messages and proofs of funds with any account, including multisig and policies, by signing the BIP-322 PSBT
 - Bitcoin: allow wallet policies on regtest
 - Bitcoin: allow exporting Taproot multisig xpubs at m/48'/coin'/account'/3' without warning
+- Bitcoin: sign MuSig2 (BIP-327) inputs of Taproot wallet policies containing `musig()` keys, including inputs whose key path and leaves use several aggregates of our key
 
 ### v9.27.1
 - API: include the installed bootloader version in the device info response

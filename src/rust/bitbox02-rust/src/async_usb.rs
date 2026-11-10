@@ -224,6 +224,8 @@ pub fn take_response() -> Result<UsbOut, CopyResponseErr> {
 /// able to read the result (e.g. when resetting the BLE chip as part of a task), so another task
 /// can spawn afterwards immediately instead of being blocked by stale executor state.
 pub fn cancel() {
+    #[cfg(feature = "app-bitcoin")]
+    crate::hww::api::bitcoin::musig2::clear();
     let _ = NEXT_REQUEST.0.borrow_mut().take();
     let mut state = USB_TASK_STATE.0.borrow_mut();
     *state = UsbTaskState::Nothing;

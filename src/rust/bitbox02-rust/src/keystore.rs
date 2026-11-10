@@ -241,6 +241,8 @@ static ROOT_FINGERPRINT: SyncCell<Option<[u8; 4]>> = SyncCell::new(None);
 
 /// Locks the keystore (resets to state before `unlock()`).
 pub fn lock() {
+    #[cfg(feature = "app-bitcoin")]
+    crate::hww::api::bitcoin::musig2::clear();
     ROOT_FINGERPRINT.write(None);
     RETAINED_SEED.write(None);
     RETAINED_SEED_HASH.write(None);
@@ -529,6 +531,8 @@ pub async fn unlock_bip39(
     mnemonic_passphrase: &str,
     yield_now: impl AsyncFn(),
 ) -> Result<(), Error> {
+    #[cfg(feature = "app-bitcoin")]
+    crate::hww::api::bitcoin::musig2::clear();
     check_retained_seed(hal, seed).map_err(|_| Error::CannotUnlockBIP39)?;
 
     let (bip39_seed, root_fingerprint) =

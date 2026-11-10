@@ -9,7 +9,7 @@ use super::super::payment_request;
 use super::common::format_amount;
 use super::policies::TaprootSpendInfo;
 use super::script_configs::{ValidatedScriptConfig, ValidatedScriptConfigWithKeypath};
-use super::{bip143, bip322, bip341, common, keypath};
+use super::{bip143, bip322, bip341, common, keypath, musig2};
 
 use crate::hal::{Memory, Ui};
 use crate::keystore::Compute;
@@ -278,6 +278,26 @@ fn validate_input(
         &input.keypath,
         keypath::ReceiveSpend::Spend,
     )
+}
+
+/// Binds the input to the MuSig2 round in the first pass and validates its MuSig2 contexts. Without
+/// a round, an input must not have any.
+fn validate_musig2_input(
+    musig_round: Option<&mut musig2::Round>,
+    tx_input: &pb::BtcSignInputRequest,
+    script_config_account: &ValidatedScriptConfigWithKeypath<'_>,
+) -> Result<(), Error> {
+    let Some(round) = musig_round else {
+        if !tx_input.musig2.is_empty() {
+            return Err(Error::InvalidInput);
+        }
+        return Ok(());
+    };
+    round.input(tx_input)?;
+    for metadata in &tx_input.musig2 {
+        musig2::context(&script_config_account.config, tx_input, metadata)?;
+    }
+    Ok(())
 }
 
 fn is_taproot(script_config_account: &ValidatedScriptConfigWithKeypath) -> bool {
@@ -694,12 +714,14 @@ struct TxHashes {
     hash_outputs: [u8; 32],
 }
 
-/// Signs the input at `input_index` with SIGHASH_ALL (SIGHASH_DEFAULT for taproot inputs) and
-/// stores the signature in `next_response`.
+/// Contribute to the MuSig2 contexts of an input in the second pass of a round: a public nonce
+/// for each context in the nonce round, or, once the host sent the public nonces of all
+/// participants, a partial signature in the signing round. A context the host skips gets no
+/// contribution.
 #[allow(clippy::too_many_arguments)]
-async fn sign_input(
+async fn sign_musig2_input(
     hal: &mut impl crate::hal::Hal,
-    xpub_cache: &mut Bip32XpubCache,
+    round: &mut musig2::Round,
     request: &pb::BtcSignInitRequest,
     tx_hashes: &TxHashes,
     input_index: u32,
@@ -707,6 +729,108 @@ async fn sign_input(
     script_config_account: &ValidatedScriptConfigWithKeypath<'_>,
     next_response: &mut NextResponse,
 ) -> Result<(), Error> {
+    for (position, metadata) in tx_input.musig2.iter().enumerate() {
+        let position = position as u32;
+        let context = musig2::context(&script_config_account.config, tx_input, metadata)?;
+        let sighash = bip341::sighash(&bip341::Args {
+            version: request.version,
+            locktime: request.locktime,
+            hash_prevouts: tx_hashes.hash_prevouts,
+            hash_amounts: tx_hashes.hash_amounts,
+            hash_scriptpubkeys: tx_hashes.hash_scriptpubkeys,
+            hash_sequences: tx_hashes.hash_sequence,
+            hash_outputs: tx_hashes.hash_outputs,
+            input_index,
+            tapleaf_hash: context.tapleaf_hash,
+        });
+        let mut result = pb::BtcMuSig2Result {
+            input_index,
+            participant_pubkey: context.participant.to_vec(),
+            context_key: metadata.context_key.clone(),
+            tapleaf_hash: metadata.tapleaf_hash.clone(),
+            ..Default::default()
+        };
+        if round.mode == musig2::Mode::Nonce {
+            result.public_nonce = round
+                .nonce(hal, input_index, position, &context, &sighash)
+                .await?
+                .to_vec();
+        } else {
+            // This is a BIP373 public-nonce exchange, independent of ECDSA anti-klepto.
+            next_response.next.musig2_index = position;
+            let request =
+                get_request(NextType::Musig2Nonces, input_index, None, next_response).await?;
+            next_response.wrap = true;
+            let Request::Btc(pb::BtcRequest {
+                request: Some(pb::btc_request::Request::Musig2Nonces(request)),
+            }) = request
+            else {
+                return Err(Error::InvalidState);
+            };
+            if request.skip {
+                // The host cannot complete this context, e.g. because another of
+                // our spend paths is used.
+                if !request.nonces.is_empty()
+                    || request.input_index != input_index
+                    || request.context_key != metadata.context_key
+                    || request.tapleaf_hash != metadata.tapleaf_hash
+                {
+                    return Err(Error::InvalidInput);
+                }
+                round.skip(input_index, position)?;
+                continue;
+            }
+            let nonces = musig2::order_nonces(input_index, metadata, &context, &request)?;
+            result.partial_signature = round
+                .sign(hal, input_index, position, &context, &sighash, &nonces)
+                .await?
+                .to_vec();
+        }
+        next_response.next.musig2_results.push(result);
+    }
+    Ok(())
+}
+
+/// Signs the input at `input_index` with SIGHASH_ALL (SIGHASH_DEFAULT for taproot inputs) and
+/// stores the signature in `next_response`.
+///
+/// In a MuSig2 round, the input must be the one of the first pass. An input with MuSig2 contexts
+/// gets our contributions to them instead of a signature, see `sign_musig2_input`, and the nonce
+/// round signs no other input either.
+#[allow(clippy::too_many_arguments)]
+async fn sign_input(
+    hal: &mut impl crate::hal::Hal,
+    xpub_cache: &mut Bip32XpubCache,
+    musig_round: Option<&mut musig2::Round>,
+    request: &pb::BtcSignInitRequest,
+    tx_hashes: &TxHashes,
+    input_index: u32,
+    tx_input: &pb::BtcSignInputRequest,
+    script_config_account: &ValidatedScriptConfigWithKeypath<'_>,
+    next_response: &mut NextResponse,
+) -> Result<(), Error> {
+    if let Some(round) = musig_round {
+        round.check_input(input_index, tx_input)?;
+        if !tx_input.musig2.is_empty() {
+            return sign_musig2_input(
+                hal,
+                round,
+                request,
+                tx_hashes,
+                input_index,
+                tx_input,
+                script_config_account,
+                next_response,
+            )
+            .await;
+        }
+        if round.mode == musig2::Mode::Nonce {
+            return Ok(());
+        }
+    } else if !tx_input.musig2.is_empty() {
+        return Err(Error::InvalidInput);
+    }
+
     if is_taproot(script_config_account) {
         // This is a taproot (P2TR) input.
 
@@ -1063,6 +1187,7 @@ async fn process_bip322(
     sign_input(
         hal,
         &mut xpub_cache,
+        None,
         request,
         &tx_hashes,
         0,
@@ -1089,6 +1214,7 @@ async fn process_bip322(
         sign_input(
             hal,
             &mut xpub_cache,
+            None,
             request,
             &tx_hashes,
             input_index,
@@ -1156,6 +1282,16 @@ async fn _process(
     if crate::keystore::is_locked() {
         return Err(Error::InvalidState);
     }
+    if let Some(init) = &request.musig2
+        && pb::btc_mu_sig2_init::Phase::try_from(init.phase)? == pb::btc_mu_sig2_init::Phase::Abort
+    {
+        musig2::abort(&init.session_id)?;
+        return Ok(Response::BtcSignNext(pb::BtcSignNextResponse {
+            r#type: NextType::Done as _,
+            ..Default::default()
+        }));
+    }
+    let mut musig_round = musig2::Round::begin(hal, request).await?;
     // Validate the coin.
     let coin = pb::BtcCoin::try_from(request.coin)?;
     let coin_params = super::params::get(coin);
@@ -1186,6 +1322,9 @@ async fn _process(
     setup_xpub_cache(&mut xpub_cache, &request.script_configs);
 
     if let Some(message) = request.bip322_message.as_ref() {
+        if musig_round.is_some() {
+            return Err(Error::InvalidInput);
+        }
         // Boxed so that the BIP-322 state does not enlarge the future of every request.
         return Box::pin(process_bip322(
             hal,
@@ -1212,6 +1351,9 @@ async fn _process(
         next: Default::default(),
         wrap: false,
     };
+    if let Some(round) = &musig_round {
+        next_response.next.musig2_session_id = round.session_id().to_vec();
+    }
 
     // Will contain the sum of all spent output values in the first inputs pass.
     let mut inputs_sum_pass1: u64 = 0;
@@ -1246,6 +1388,7 @@ async fn _process(
             .get(tx_input.script_config_index as usize)
             .ok_or(Error::InvalidInput)?;
         validate_input(&tx_input, coin_params, script_config_account)?;
+        validate_musig2_input(musig_round.as_mut(), &tx_input, script_config_account)?;
         if tx_input.sequence < 0xffffffff {
             locktime_applies = true;
         }
@@ -1350,6 +1493,9 @@ async fn _process(
     let mut hasher_outputs = Sha256::new();
     for output_index in 0..request.num_outputs {
         let tx_output = get_tx_output(output_index, &mut next_response).await?;
+        if let Some(round) = musig_round.as_mut() {
+            round.output(&tx_output);
+        }
         if output_index == 0 {
             // Stop rendering inputs progress update.
             drop(progress_component.take());
@@ -1641,6 +1787,9 @@ async fn _process(
         fee_percentage_basis,
     )
     .await?;
+    if let Some(round) = musig_round.as_mut() {
+        round.approve()?;
+    }
     let status = crate::tr!(hal, "Transaction\nconfirmed");
     hal.ui().status(&status, true).await;
 
@@ -1685,6 +1834,7 @@ async fn _process(
         Box::pin(sign_input(
             hal,
             &mut xpub_cache,
+            musig_round.as_mut(),
             request,
             &tx_hashes,
             input_index,
@@ -1704,6 +1854,9 @@ async fn _process(
         return Err(Error::InvalidInput);
     }
 
+    if let Some(round) = musig_round {
+        next_response.next.musig2_session_id = round.finish()?.to_vec();
+    }
     next_response.next.r#type = NextType::Done as _;
     Ok(next_response.to_protobuf())
 }
@@ -1712,7 +1865,8 @@ pub async fn process(
     hal: &mut impl crate::hal::Hal,
     request: &pb::BtcSignInitRequest,
 ) -> Result<Response, Error> {
-    let result = _process(hal, request).await;
+    // Boxed so that the MuSig2 round does not enlarge the future of every request.
+    let result = Box::pin(_process(hal, request)).await;
     // Aborting a BIP-322 message is not confirmed with a status, like in BTCSignMessage.
     if let Err(Error::UserAbort) = result
         && request.bip322_message.is_none()
@@ -4334,3 +4488,6 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod musig2_tests;

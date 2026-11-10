@@ -6,6 +6,7 @@ use super::*;
 use alloc::string::ToString;
 use bitbox_secp256k1::musig::KeyAgg;
 use bitcoin::bip32::{ChainCode, ChildNumber, Fingerprint, Xpub};
+use bitcoin::hashes::Hash;
 
 /// A policy key and its two public receive/change branches.
 pub(super) struct Placeholder {
@@ -170,6 +171,108 @@ pub(super) fn parse_tr(template: &str) -> Result<miniscript::descriptor::Tr<Stri
         .map_err(|_| Error::InvalidInput)
 }
 
+/// Verified policy context for one participant's contribution.
+pub struct SigningContext {
+    pub aggregate: KeyAgg,
+    pub participants: Vec<[u8; 33]>,
+    pub bare_key: [u8; 33],
+    pub internal_key: [u8; 33],
+    pub keypath: Vec<u32>,
+    pub participant: [u8; 33],
+    pub tapleaf_hash: Option<[u8; 32]>,
+}
+
+impl ParsedPolicy<'_> {
+    /// Resolve an explicit aggregate expression and address selector to a spend.
+    /// The selector consists of our participant's origin path followed by the
+    /// aggregate branch/index; only the origin path is used for private derivation.
+    pub fn musig_context(
+        &self,
+        expression: &str,
+        selector: &[u32],
+    ) -> Result<SigningContext, Error> {
+        if !self.iter_pk().any(|key| key == expression) {
+            return Err(Error::InvalidInput);
+        }
+        let placeholder = Placeholder::parse(expression)?;
+        if !placeholder.musig || selector.len() < 2 {
+            return Err(Error::InvalidInput);
+        }
+        let origin = &selector[..selector.len() - 2];
+        let key_index = placeholder
+            .indexes
+            .iter()
+            .copied()
+            .find(|&i| {
+                self.is_our_key.get(i) == Some(&true) && self.policy.keys[i].keypath == origin
+            })
+            .ok_or(Error::InvalidInput)?;
+        let branch = selector[selector.len() - 2];
+        let change = if branch == placeholder.left {
+            false
+        } else if branch == placeholder.right {
+            true
+        } else {
+            return Err(Error::InvalidInput);
+        };
+        let index = selector[selector.len() - 1];
+        // The sighash and change UI resolve this selector across the whole
+        // policy. Reject ambiguous branches that resolve to a different spend.
+        if get_change_and_address_index(
+            self.iter_pk(),
+            &self.policy.keys,
+            &self.is_our_key,
+            selector,
+        )? != (change, index)
+        {
+            return Err(Error::InvalidInput);
+        }
+        let (mut aggregate, participants, bare_key) =
+            placeholder.derive(&self.policy.keys, change, index)?;
+        let internal_key = aggregate.public_key().serialize();
+        let Descriptor::Tr(derived) = self.derive(change, index)? else {
+            return Err(Error::InvalidInput);
+        };
+        let Descriptor::Tr(template) = &self.descriptor else {
+            return Err(Error::InvalidInput);
+        };
+        let tapleaf_hash = if template.inner.internal_key() == expression {
+            let spend = derived.inner.spend_info();
+            let tweak = TapTweakHash::from_key_and_tweak(spend.internal_key(), spend.merkle_root());
+            aggregate = aggregate
+                .tweak(tweak.as_byte_array(), true)
+                .map_err(|_| Error::InvalidInput)?;
+            if aggregate.public_key().x_only_public_key().0.serialize() != derived.output_key() {
+                return Err(Error::Generic);
+            }
+            None
+        } else {
+            Some(
+                derived
+                    .get_leaf_hash_by_pubkey(&internal_key)
+                    .ok_or(Error::InvalidInput)?
+                    .to_byte_array(),
+            )
+        };
+        Ok(SigningContext {
+            aggregate,
+            participants,
+            bare_key,
+            internal_key,
+            keypath: origin.to_vec(),
+            participant: self.policy.keys[key_index]
+                .xpub
+                .as_ref()
+                .ok_or(Error::InvalidInput)?
+                .public_key
+                .as_slice()
+                .try_into()
+                .map_err(|_| Error::InvalidInput)?,
+            tapleaf_hash,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +322,70 @@ mod tests {
                 aggregate.public_key().x_only_public_key().0.serialize(),
                 *expected
             );
+        }
+    }
+
+    #[async_test::test]
+    async fn test_musig_context() {
+        crate::keystore::testing::mock_unlocked();
+        let mut hal = TestingHal::new();
+        let origin = vec![48 + HARDENED, 1 + HARDENED, HARDENED, 3 + HARDENED];
+        let ours = pb::KeyOriginInfo {
+            root_fingerprint: crate::keystore::root_fingerprint().unwrap(),
+            keypath: origin.clone(),
+            xpub: Some(
+                crate::keystore::get_xpub(&mut hal, &origin, crate::keystore::Compute::Once)
+                    .await
+                    .unwrap()
+                    .into(),
+            ),
+        };
+        let mut other = ours.clone();
+        other.root_fingerprint.clear();
+        let external =
+            bitcoin::bip32::Xpriv::new_master(bitcoin::NetworkKind::Test, &[17; 32]).unwrap();
+        other.xpub =
+            Some(bip32::Xpub::from(Xpub::from_priv(crate::secp256k1::SECP256K1, &external)).into());
+        let selector: Vec<_> = origin.iter().copied().chain([1, 5]).collect();
+        for expression in ["tr(musig(@0,@1)/**)", "tr(@0/<2;3>/*,pk(musig(@0,@1)/**))"] {
+            let policy = Policy {
+                policy: expression.into(),
+                keys: vec![ours.clone(), other.clone()],
+            };
+            let parsed = parse(&mut hal, &policy, BtcCoin::Tbtc).await.unwrap();
+            let ctx = parsed.musig_context("musig(@0,@1)/**", &selector).unwrap();
+            assert_eq!(ctx.keypath, origin);
+            assert_eq!(
+                ctx.participant.as_slice(),
+                ours.xpub.as_ref().unwrap().public_key
+            );
+            assert_eq!(ctx.participants.len(), 2);
+            assert!(ctx.participants[0] < ctx.participants[1]);
+            assert_eq!(ctx.tapleaf_hash.is_some(), expression.starts_with("tr(@"));
+            assert!(parsed.is_change_keypath(&selector).unwrap());
+            assert!(parsed.musig_context("musig(@0,@2)/**", &selector).is_err());
+            let mut hardened = selector.clone();
+            *hardened.last_mut().unwrap() = HARDENED;
+            assert!(parsed.musig_context("musig(@0,@1)/**", &hardened).is_err());
+            // Compare the aggregate child against independent BIP32 CKDpub.
+            let bare = bitcoin::secp256k1::PublicKey::from_slice(&ctx.bare_key).unwrap();
+            let synthetic = Xpub {
+                network: bitcoin::NetworkKind::Main,
+                depth: 0,
+                parent_fingerprint: Fingerprint::default(),
+                child_number: ChildNumber::from(0),
+                public_key: bare,
+                chain_code: ChainCode::from(hex_lit::hex!(
+                    "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
+                )),
+            };
+            let child = synthetic
+                .derive_pub(
+                    crate::secp256k1::SECP256K1,
+                    &bip32::keypath_from_slice(&[1, 5]),
+                )
+                .unwrap();
+            assert_eq!(ctx.internal_key, child.public_key.serialize());
         }
     }
 }
