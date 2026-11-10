@@ -6,6 +6,12 @@ recorded separately.
 
 ## Firmware
 
+### v9.29.0
+- Bitcoin: sign MuSig2 (BIP-327) inputs of Taproot wallet policies containing `musig()` keys, including single-round signing when the device is the last participant to contribute a nonce, and inputs whose key path and leaves use several aggregates of our key
+- Bitcoin: allow exporting Taproot multisig xpubs at m/48'/coin'/account'/3' without warning
+- Bitcoin: allow wallet policies on regtest
+- Bitcoin: sign BIP-322 messages and proofs of funds with MuSig2 inputs
+
 ### Unreleased
 - API: include the installed stage0 version in the device info response
 - Allow entering the optional BIP39 passphrase on the host, with device approval and confirmation
@@ -16,10 +22,6 @@ recorded separately.
 - Add German firmware translations
 - Bitcoin: allow signing messages with taproot (P2TR) keys, as BIP-322 simple signatures
 - Bitcoin: sign BIP-322 messages and proofs of funds with any account, including multisig and policies, by signing the BIP-322 PSBT
-- Bitcoin: allow wallet policies on regtest
-- Bitcoin: allow exporting Taproot multisig xpubs at m/48'/coin'/account'/3' without warning
-- Bitcoin: sign MuSig2 (BIP-327) inputs of Taproot wallet policies containing `musig()` keys, including single-round signing when the device is the last participant to contribute a nonce, and inputs whose key path and leaves use several aggregates of our key
-- Bitcoin: sign BIP-322 messages and proofs of funds with MuSig2 inputs
 
 ### v9.27.1
 - API: include the installed bootloader version in the device info response
