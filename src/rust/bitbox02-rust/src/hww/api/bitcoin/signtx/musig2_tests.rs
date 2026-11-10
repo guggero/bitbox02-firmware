@@ -970,3 +970,147 @@ async fn test_musig2_signtx_rejects_bad_skips() {
         );
     }
 }
+
+/// Turn the fixture into a BIP-322 signature of `message` by the address of its first input:
+/// the first input becomes the spend of the `to_spend` transaction committing to the message and
+/// that address, and the other `num_inputs - 1` inputs the coins of a proof of funds.
+fn bip322(fixture: &mut Fixture, message: &[u8], num_inputs: usize) {
+    fixture.inputs.truncate(num_inputs);
+    fixture.prevouts.truncate(num_inputs);
+    fixture.contexts.truncate(num_inputs);
+    let challenge = fixture.prevouts[0].script_pubkey.as_bytes();
+    let first = &mut fixture.inputs[0];
+    first.prev_out_hash = bip322::to_spend_txid(message, challenge).to_vec();
+    first.prev_out_value = 0;
+    first.sequence = 0;
+    fixture.prevouts[0].value = Amount::ZERO;
+    fixture.output = pb::BtcSignOutputRequest {
+        r#type: pb::BtcOutputType::OpReturn as _,
+        ..Default::default()
+    };
+    fixture.init.version = 0;
+    fixture.init.num_inputs = num_inputs as _;
+    fixture.init.bip322_message = Some(message.to_vec());
+    let to_sign = Transaction {
+        version: bitcoin::transaction::Version(0),
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: fixture
+            .inputs
+            .iter()
+            .map(|input| TxIn {
+                previous_output: OutPoint {
+                    txid: bitcoin::Txid::from_slice(&input.prev_out_hash).unwrap(),
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence(input.sequence),
+                witness: Witness::new(),
+            })
+            .collect(),
+        output: vec![TxOut {
+            value: Amount::ZERO,
+            script_pubkey: bitcoin::script::Builder::new()
+                .push_opcode(bitcoin::opcodes::all::OP_RETURN)
+                .into_script(),
+        }],
+    };
+    fixture.messages = sighashes(&to_sign, &fixture.prevouts, &fixture.contexts);
+}
+
+/// Whether the round reviewed the message as BIP-322 message signing.
+fn reviewed_message(hal: &TestingHal<'_>, message: &str) -> bool {
+    let screens = &hal.ui.screens;
+    screens
+        .iter()
+        .any(|screen| matches!(screen, Screen::Confirm { title, .. } if title == "Sign message"))
+        && screens
+            .iter()
+            .any(|screen| matches!(screen, Screen::Confirm { body, .. } if body.contains(message)))
+}
+
+#[async_test::test]
+async fn test_musig2_bip322() {
+    // A message signature, and a proof of funds with a second MuSig input, through the key path
+    // and through a leaf, in two rounds.
+    const MESSAGE: &str = "MuSig2 message";
+    for leaf in [false, true] {
+        for num_inputs in [1, 2] {
+            let mut hal = TestingHal::new();
+            let mut fixture = fixture(&mut hal, leaf).await;
+            bip322(&mut fixture, MESSAGE.as_bytes(), num_inputs);
+
+            let (public, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+            assert_eq!(public.len(), num_inputs);
+            assert!(public.iter().all(|result| result.public_nonce.len() == 66));
+            assert!(reviewed_message(&hal, MESSAGE));
+
+            hal.ui = crate::hal::testing::ui::TestingUi::new();
+            fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+                phase: Phase::Sign as _,
+                session_id: id,
+            });
+            let (requests, ordered) = signing_requests(&fixture, &public);
+            let (partials, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+            assert_eq!(partials.len(), num_inputs);
+            assert!(reviewed_message(&hal, MESSAGE));
+            for (i, partial) in partials.iter().enumerate() {
+                assert_eq!(partial.input_index, i as u32);
+                verify_partial_of(&fixture, i, &ordered[i], &partial.partial_signature);
+            }
+        }
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_bip322_nonce_and_sign() {
+    const MESSAGE: &str = "MuSig2 message in one round";
+    for leaf in [false, true] {
+        let mut hal = TestingHal::new();
+        let mut fixture = fixture(&mut hal, leaf).await;
+        bip322(&mut fixture, MESSAGE.as_bytes(), 1);
+        fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+            phase: Phase::NonceAndSign as _,
+            session_id: vec![],
+        });
+        let (peers, requests) = peer_nonces(&fixture);
+        let (results, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(reviewed_message(&hal, MESSAGE));
+        let ctx = &fixture.contexts[0];
+        let nonces: Vec<[u8; 66]> = ctx
+            .participants
+            .iter()
+            .map(|key| {
+                if key == &ctx.participant {
+                    results[0].public_nonce.as_slice().try_into().unwrap()
+                } else {
+                    peers[0].public_nonce()
+                }
+            })
+            .collect();
+        verify_partial_of(&fixture, 0, &nonces, &results[0].partial_signature);
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_bip322_rejects_changes() {
+    // The signing round must sign the message the nonce round was approved for.
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture(&mut hal, false).await;
+    bip322(&mut fixture, b"approved message", 1);
+    let (public, id) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+    let (requests, _) = signing_requests(&fixture, &public);
+    bip322(&mut fixture, b"another message", 1);
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    assert_eq!(
+        run(&mut hal, &fixture, requests, false).await,
+        Err(Error::InvalidInput)
+    );
+    assert_eq!(
+        process(&mut hal, &fixture.init).await,
+        Err(Error::InvalidState)
+    );
+}

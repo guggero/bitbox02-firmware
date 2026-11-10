@@ -1033,6 +1033,7 @@ async fn process_bip322(
     format_unit: FormatUnit,
     validated_script_configs: &[ValidatedScriptConfigWithKeypath<'_>],
     mut xpub_cache: Bip32XpubCache,
+    mut musig_round: Option<musig2::Round>,
 ) -> Result<Response, Error> {
     // Same coins as in BTCSignMessage.
     if !matches!(
@@ -1057,6 +1058,9 @@ async fn process_bip322(
         next: Default::default(),
         wrap: false,
     };
+    if let Some(round) = &musig_round {
+        next_response.next.musig2_session_id = round.session_id().to_vec();
+    }
 
     let tx_input = get_tx_input(0, &mut next_response).await?;
     let script_config_account = validated_script_configs
@@ -1071,6 +1075,7 @@ async fn process_bip322(
         script_config_account,
     )
     .await?;
+    validate_musig2_input(musig_round.as_mut(), &tx_input, script_config_account)?;
     let address = payload.address(coin_params)?;
     let pk_script = payload.pk_script(coin_params)?;
 
@@ -1106,6 +1111,7 @@ async fn process_bip322(
                 .get(tx_input.script_config_index as usize)
                 .ok_or(Error::InvalidInput)?;
             validate_input(&tx_input, coin_params, script_config_account)?;
+            validate_musig2_input(musig_round.as_mut(), &tx_input, script_config_account)?;
             coins_sum_pass1 = coins_sum_pass1
                 .checked_add(tx_input.prev_out_value)
                 .ok_or(Error::InvalidInput)?;
@@ -1146,6 +1152,9 @@ async fn process_bip322(
     {
         return Err(Error::InvalidInput);
     }
+    if let Some(round) = musig_round.as_mut() {
+        round.output(&tx_output);
+    }
 
     let tx_hashes = TxHashes {
         hash_prevouts: hasher_prevouts.finalize().into(),
@@ -1177,6 +1186,9 @@ async fn process_bip322(
             .await?;
     }
     super::signmsg::confirm_message(hal, message).await?;
+    if let Some(round) = musig_round.as_mut() {
+        round.approve()?;
+    }
 
     // The input is validated again: it is the one of the second pass that is signed.
     let tx_input = get_tx_input(0, &mut next_response).await?;
@@ -1195,7 +1207,7 @@ async fn process_bip322(
     sign_input(
         hal,
         &mut xpub_cache,
-        None,
+        musig_round.as_mut(),
         request,
         &tx_hashes,
         0,
@@ -1222,7 +1234,7 @@ async fn process_bip322(
         sign_input(
             hal,
             &mut xpub_cache,
-            None,
+            musig_round.as_mut(),
             request,
             &tx_hashes,
             input_index,
@@ -1236,6 +1248,9 @@ async fn process_bip322(
         return Err(Error::InvalidInput);
     }
 
+    if let Some(round) = musig_round {
+        next_response.next.musig2_session_id = round.finish()?.to_vec();
+    }
     next_response.next.r#type = NextType::Done as _;
     Ok(next_response.to_protobuf())
 }
@@ -1330,9 +1345,6 @@ async fn _process(
     setup_xpub_cache(&mut xpub_cache, &request.script_configs);
 
     if let Some(message) = request.bip322_message.as_ref() {
-        if musig_round.is_some() {
-            return Err(Error::InvalidInput);
-        }
         // Boxed so that the BIP-322 state does not enlarge the future of every request.
         return Box::pin(process_bip322(
             hal,
@@ -1342,6 +1354,7 @@ async fn _process(
             format_unit,
             &validated_script_configs,
             xpub_cache,
+            musig_round,
         ))
         .await;
     }
