@@ -169,8 +169,22 @@ key-path and script-path signtx exchanges, multiple inputs, independent transact
 sighashes, malformed records, transaction substitution, single-use state,
 capacity limits, cancellation, and Python transport compatibility.
 
-The protocol and policy tests run with the normal single-threaded Rust workspace
-suite. Python transport tests run with:
+To export public transcripts and check them with a local BIPs checkout:
+
+```sh
+# Run in the build container, from src/rust (choose an absolute output path).
+BITBOX_MUSIG2_FIXTURES=/tmp/musig2-transcripts cargo test \
+  -p bitbox02-rust --all-features test_musig2_signtx -- --test-threads 1
+
+# Run where both the transcript directory and BIPs checkout are accessible.
+python3 scripts/check_musig2_reference.py /tmp/musig2-transcripts \
+  ../../bips/bip-0327/reference.py
+```
+
+The checker independently recomputes aggregate keys, verifies every partial,
+combines on the host, and verifies the final BIP340 signatures. The protocol and
+policy tests run with the normal single-threaded Rust workspace suite. Python
+transport tests run with:
 
 ```sh
 PYTHONPATH=py/bitbox02 python3 -m unittest discover -s py/bitbox02/tests -p test_musig2.py -v

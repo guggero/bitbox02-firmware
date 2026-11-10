@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+extern crate std;
+
 use super::super::policies;
 use super::*;
 use crate::hal::testing::ui::Screen;
@@ -21,6 +23,7 @@ struct Fixture {
     contexts: Vec<policies::musig::SigningContext>,
     messages: Vec<[u8; 32]>,
     other_secret: [u8; 32],
+    tweaks: Vec<Vec<[u8; 32]>>,
 }
 
 /// A registered MuSig wallet policy and the aggregate the fixture signs for.
@@ -32,6 +35,9 @@ struct Wallet {
     other: usize,
     /// Number of keys in the policy. @0 is ours, the others are bare xpubs.
     num_keys: usize,
+    /// Whether the key path has no script tree, i.e. the BIP-86 tweak applies.
+    /// Only used for the exported reference transcripts.
+    bip86: bool,
 }
 
 const KEY_PATH_WALLET: Wallet = Wallet {
@@ -39,6 +45,7 @@ const KEY_PATH_WALLET: Wallet = Wallet {
     expression: "musig(@0,@1)/**",
     other: 1,
     num_keys: 2,
+    bip86: true,
 };
 
 const LEAF_WALLET: Wallet = Wallet {
@@ -46,6 +53,7 @@ const LEAF_WALLET: Wallet = Wallet {
     expression: "musig(@0,@1)/**",
     other: 1,
     num_keys: 2,
+    bip86: false,
 };
 
 async fn fixture(hal: &mut TestingHal<'_>, leaf: bool) -> Fixture {
@@ -89,6 +97,7 @@ async fn fixture_for(hal: &mut TestingHal<'_>, wallet: &Wallet) -> Fixture {
     let mut inputs = Vec::new();
     let mut contexts = Vec::new();
     let mut prevouts = Vec::new();
+    let mut tweaks = Vec::new();
     // Two inputs exercise piggybacked results and the same participant key with
     // distinct nonces. The second input chooses a different aggregate child.
     for index in 0..2 {
@@ -101,6 +110,41 @@ async fn fixture_for(hal: &mut TestingHal<'_>, wallet: &Wallet) -> Fixture {
             ScriptBuf::new_p2tr_tweaked(bitcoin::key::TweakedPublicKey::dangerous_assume_tweaked(
                 bitcoin::secp256k1::XOnlyPublicKey::from_slice(&tr.output_key()).unwrap(),
             ));
+        // Reconstruct the tweak sequence independently for reference interop.
+        let mut aggregate_xpub = Xpub {
+            network: bitcoin::NetworkKind::Main,
+            depth: 0,
+            parent_fingerprint: Default::default(),
+            child_number: 0.into(),
+            public_key: bitcoin::secp256k1::PublicKey::from_slice(&context.bare_key).unwrap(),
+            chain_code: hex_lit::hex!(
+                "868087ca02a6f974c4598924c36b57762d32cb45717167e300622c7167e38965"
+            )
+            .into(),
+        };
+        let mut input_tweaks = Vec::new();
+        for child in [0, index] {
+            let child = bitcoin::bip32::ChildNumber::from_normal_idx(child).unwrap();
+            input_tweaks.push(
+                aggregate_xpub
+                    .ckd_pub_tweak(child)
+                    .unwrap()
+                    .0
+                    .secret_bytes(),
+            );
+            aggregate_xpub = aggregate_xpub.ckd_pub(SECP256K1, child).unwrap();
+        }
+        assert_eq!(aggregate_xpub.public_key.serialize(), context.internal_key);
+        if wallet.bip86 {
+            input_tweaks.push(
+                bitcoin::TapTweakHash::from_key_and_tweak(
+                    aggregate_xpub.public_key.x_only_public_key().0,
+                    None,
+                )
+                .to_byte_array(),
+            );
+        }
+        tweaks.push(input_tweaks);
         prevouts.push(TxOut {
             value: Amount::from_sat(100_000),
             script_pubkey: script,
@@ -180,6 +224,7 @@ async fn fixture_for(hal: &mut TestingHal<'_>, wallet: &Wallet) -> Fixture {
         contexts,
         messages,
         other_secret: other.private_key.secret_bytes(),
+        tweaks,
     }
 }
 
@@ -404,6 +449,7 @@ async fn test_musig2_signtx() {
         assert_eq!(id.len(), 32);
         let mut requests = Vec::new();
         let mut ordered = Vec::new();
+        let mut peer_signatures = Vec::new();
         for (i, result) in public.iter().enumerate() {
             let ctx = &fixture.contexts[i];
             assert_eq!(result.input_index, i as u32);
@@ -447,15 +493,16 @@ async fn test_musig2_signtx() {
                 tapleaf_hash: public[i].tapleaf_hash.clone(),
                 nonces: records,
             });
-            // The other participant can sign with our nonce.
-            other
-                .sign(
-                    &fixture.other_secret,
-                    &ctx.aggregate,
-                    &nonces,
-                    &fixture.messages[i],
-                )
-                .unwrap();
+            peer_signatures.push(
+                other
+                    .sign(
+                        &fixture.other_secret,
+                        &ctx.aggregate,
+                        &nonces,
+                        &fixture.messages[i],
+                    )
+                    .unwrap(),
+            );
             ordered.push(nonces);
         }
         fixture.init.musig2 = Some(pb::BtcMuSig2Init {
@@ -481,6 +528,35 @@ async fn test_musig2_signtx() {
                 &fixture.messages[i],
                 signer,
                 sig.as_slice().try_into().unwrap(),
+            )
+            .unwrap();
+        }
+        // Optional public-only transcript for an independent BIP327 checker.
+        // No firmware or participant private key/nonce is included.
+        if let Ok(directory) = std::env::var("BITBOX_MUSIG2_FIXTURES") {
+            let records: Vec<_> = fixture.contexts.iter().enumerate().map(|(i, ctx)| {
+                let sig = &partials[i].partial_signature;
+                let signer = ctx.participants.iter().position(|key| key == &ctx.participant).unwrap();
+                let mut signatures = vec![hex::encode(peer_signatures[i]); 2];
+                signatures[signer] = hex::encode(sig);
+                serde_json::json!({
+                    "pubkeys": ctx.participants.iter().map(hex::encode).collect::<Vec<_>>(),
+                    "pubnonces": ordered[i].iter().map(hex::encode).collect::<Vec<_>>(),
+                    "tweaks": fixture.tweaks[i].iter().map(hex::encode).collect::<Vec<_>>(),
+                    "is_xonly": if leaf { vec![false, false] } else { vec![false, false, true] },
+                    "message": hex::encode(fixture.messages[i]),
+                    "aggregate_key": hex::encode(ctx.aggregate.public_key().serialize()),
+                    "partial_signatures": signatures,
+                })
+            }).collect();
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(
+                std::path::Path::new(&directory).join(if leaf {
+                    "scriptpath.json"
+                } else {
+                    "keypath.json"
+                }),
+                serde_json::to_vec_pretty(&records).unwrap(),
             )
             .unwrap();
         }
@@ -605,6 +681,7 @@ async fn two_context_fixtures(hal: &mut TestingHal<'_>) -> (Fixture, Fixture) {
             expression: "musig(@0,@2)/**",
             other: 2,
             num_keys: 3,
+            bip86: false,
         },
     )
     .await;
@@ -615,6 +692,7 @@ async fn two_context_fixtures(hal: &mut TestingHal<'_>) -> (Fixture, Fixture) {
             expression: "musig(@0,@1)/**",
             other: 1,
             num_keys: 3,
+            bip86: false,
         },
     )
     .await;
@@ -809,12 +887,14 @@ async fn test_musig2_signtx_nonce_and_sign_2of3() {
     // Our key is part of two aggregates, the key path and one leaf. Each is a
     // distinct session, and only the requested expression is signed.
     const POLICY: &str = "tr(musig(@0,@1)/**,{pk(musig(@0,@2)/**),pk(musig(@1,@2)/**)})";
-    for (expression, other) in [("musig(@0,@1)/**", 1), ("musig(@0,@2)/**", 2)] {
+    for (expression, other, bip86) in [("musig(@0,@1)/**", 1, false), ("musig(@0,@2)/**", 2, false)]
+    {
         Box::pin(check_nonce_and_sign(&Wallet {
             policy: POLICY,
             expression,
             other,
             num_keys: 3,
+            bip86,
         }))
         .await;
     }
@@ -978,6 +1058,7 @@ fn bip322(fixture: &mut Fixture, message: &[u8], num_inputs: usize) {
     fixture.inputs.truncate(num_inputs);
     fixture.prevouts.truncate(num_inputs);
     fixture.contexts.truncate(num_inputs);
+    fixture.tweaks.truncate(num_inputs);
     let challenge = fixture.prevouts[0].script_pubkey.as_bytes();
     let first = &mut fixture.inputs[0];
     first.prev_out_hash = bip322::to_spend_txid(message, challenge).to_vec();
