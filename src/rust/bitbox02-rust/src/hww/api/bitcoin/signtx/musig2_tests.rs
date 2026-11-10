@@ -730,3 +730,243 @@ async fn test_musig2_signtx_rejects_duplicate_contexts() {
         Err(Error::InvalidInput)
     );
 }
+
+/// Run a NONCE_AND_SIGN round for the wallet and verify every contribution as the
+/// host would, then complete the signature with the peer.
+async fn check_nonce_and_sign(wallet: &Wallet) {
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture_for(&mut hal, wallet).await;
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::NonceAndSign as _,
+        session_id: vec![],
+    });
+    let (peers, requests) = peer_nonces(&fixture);
+    let (results, id) = run(&mut hal, &fixture, requests.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(id.len(), 32);
+    assert_eq!(results.len(), 2);
+    for (i, peer) in peers.into_iter().enumerate() {
+        let ctx = &fixture.contexts[i];
+        let result = &results[i];
+        assert_eq!(result.input_index, i as u32);
+        assert_eq!(result.participant_pubkey, ctx.participant.to_vec());
+        assert_eq!(result.public_nonce.len(), 66);
+        assert_eq!(result.partial_signature.len(), 32);
+        let nonces: Vec<[u8; 66]> = ctx
+            .participants
+            .iter()
+            .map(|key| {
+                if key == &ctx.participant {
+                    result.public_nonce.as_slice().try_into().unwrap()
+                } else {
+                    peer.public_nonce()
+                }
+            })
+            .collect();
+        let signer = ctx
+            .participants
+            .iter()
+            .position(|key| key == &ctx.participant)
+            .unwrap();
+        verify_partial(
+            &ctx.aggregate,
+            &nonces,
+            &fixture.messages[i],
+            signer,
+            result.partial_signature.as_slice().try_into().unwrap(),
+        )
+        .unwrap();
+        // The peer, which contributed its nonce first, can finish the session.
+        peer.sign(
+            &fixture.other_secret,
+            &ctx.aggregate,
+            &nonces,
+            &fixture.messages[i],
+        )
+        .unwrap();
+    }
+
+    // Nothing was retained: the handle cannot be used to sign, and the same
+    // transaction can be signed again in a fresh single round.
+    let mut signing = fixture.init.clone();
+    signing.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: id,
+    });
+    assert_eq!(process(&mut hal, &signing).await, Err(Error::InvalidState));
+    run(&mut hal, &fixture, requests, false).await.unwrap();
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_nonce_and_sign() {
+    Box::pin(check_nonce_and_sign(&KEY_PATH_WALLET)).await;
+    Box::pin(check_nonce_and_sign(&LEAF_WALLET)).await;
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_nonce_and_sign_2of3() {
+    // Our key is part of two aggregates, the key path and one leaf. Each is a
+    // distinct session, and only the requested expression is signed.
+    const POLICY: &str = "tr(musig(@0,@1)/**,{pk(musig(@0,@2)/**),pk(musig(@1,@2)/**)})";
+    for (expression, other) in [("musig(@0,@1)/**", 1), ("musig(@0,@2)/**", 2)] {
+        Box::pin(check_nonce_and_sign(&Wallet {
+            policy: POLICY,
+            expression,
+            other,
+            num_keys: 3,
+        }))
+        .await;
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_nonce_and_sign_rejects_bad_nonces() {
+    for mutation in 0..3 {
+        let mut hal = TestingHal::new();
+        let mut fixture = fixture(&mut hal, false).await;
+        fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+            phase: Phase::NonceAndSign as _,
+            session_id: vec![],
+        });
+        let (_, mut requests) = peer_nonces(&fixture);
+        let ctx = &fixture.contexts[0];
+        match mutation {
+            // Our own nonce must not be supplied by the host.
+            0 => {
+                let public_nonce = requests[0].nonces[0].public_nonce.clone();
+                requests[0].nonces.push(pb::BtcMuSig2Nonce {
+                    participant_pubkey: ctx.participant.to_vec(),
+                    public_nonce,
+                })
+            }
+            // Every other participant's nonce is required.
+            1 => requests[0].nonces.clear(),
+            // A nonce for someone other than the peer is rejected.
+            _ => requests[0].nonces[0].participant_pubkey[1] ^= 1,
+        }
+        assert_eq!(
+            run(&mut hal, &fixture, requests, false).await,
+            Err(Error::InvalidInput)
+        );
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_nonce_and_sign_keeps_pending_session() {
+    // A retained nonce round of another session is neither needed nor touched.
+    let mut hal = TestingHal::new();
+    let mut fixture = fixture(&mut hal, false).await;
+    let (public, pending) = run(&mut hal, &fixture, vec![], false).await.unwrap();
+
+    let nonce_round = fixture.init.clone();
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::NonceAndSign as _,
+        session_id: vec![],
+    });
+    let (peers, requests) = peer_nonces(&fixture);
+    run(&mut hal, &fixture, requests, false).await.unwrap();
+
+    // A session ID is never accepted for NONCE_AND_SIGN.
+    fixture.init.musig2.as_mut().unwrap().session_id = pending.clone();
+    assert_eq!(
+        process(&mut hal, &fixture.init).await,
+        Err(Error::InvalidInput)
+    );
+
+    // The pending session survived and completes with all participants' nonces.
+    fixture.init = nonce_round;
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::Sign as _,
+        session_id: pending,
+    });
+    let requests = fixture
+        .contexts
+        .iter()
+        .enumerate()
+        .map(|(i, ctx)| pb::BtcMuSig2NoncesRequest {
+            input_index: i as _,
+            skip: false,
+            context_key: public[i].context_key.clone(),
+            tapleaf_hash: public[i].tapleaf_hash.clone(),
+            nonces: ctx
+                .participants
+                .iter()
+                .map(|key| pb::BtcMuSig2Nonce {
+                    participant_pubkey: key.to_vec(),
+                    public_nonce: if key == &ctx.participant {
+                        public[i].public_nonce.clone()
+                    } else {
+                        peers[i].public_nonce().to_vec()
+                    },
+                })
+                .collect(),
+        })
+        .collect();
+    let (partials, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+    assert_eq!(partials.len(), 2);
+    assert!(partials.iter().all(|p| p.partial_signature.len() == 32));
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_several_contexts_nonce_and_sign() {
+    // As the last participant, the device signs the contexts whose other nonces are
+    // known and skips the rest.
+    let mut hal = TestingHal::new();
+    let (mut fixture, leaf) = two_context_fixtures(&mut hal).await;
+    fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+        phase: Phase::NonceAndSign as _,
+        session_id: vec![],
+    });
+    let (peers, leaf_requests) = peer_nonces(&leaf);
+    let mut requests = Vec::new();
+    for (index, request) in leaf_requests.into_iter().enumerate() {
+        requests.push(skip(index, &fixture.inputs[index].musig2[0]));
+        requests.push(request);
+    }
+    let (results, _) = run(&mut hal, &fixture, requests, false).await.unwrap();
+    assert_eq!(results.len(), 2);
+    for (index, result) in results.iter().enumerate() {
+        assert_eq!(result.input_index, index as u32);
+        assert_eq!(
+            result.tapleaf_hash,
+            leaf.inputs[index].musig2[0].tapleaf_hash
+        );
+        verify_ours(
+            &leaf,
+            index,
+            &result.public_nonce,
+            &peers[index].public_nonce(),
+            &result.partial_signature,
+        );
+    }
+}
+
+#[async_test::test]
+async fn test_musig2_signtx_rejects_bad_skips() {
+    // A skip carries no nonces and names the context it skips.
+    for mutation in 0..2 {
+        let mut hal = TestingHal::new();
+        let (mut fixture, leaf) = two_context_fixtures(&mut hal).await;
+        fixture.init.musig2 = Some(pb::BtcMuSig2Init {
+            phase: Phase::NonceAndSign as _,
+            session_id: vec![],
+        });
+        let (_, leaf_requests) = peer_nonces(&leaf);
+        let mut requests = Vec::new();
+        for (index, request) in leaf_requests.into_iter().enumerate() {
+            let mut skipped = skip(index, &fixture.inputs[index].musig2[0]);
+            if mutation == 0 {
+                skipped.nonces = request.nonces.clone();
+            } else {
+                skipped.context_key = request.context_key.clone();
+            }
+            requests.push(skipped);
+            requests.push(request);
+        }
+        assert_eq!(
+            run(&mut hal, &fixture, requests, false).await,
+            Err(Error::InvalidInput)
+        );
+    }
+}

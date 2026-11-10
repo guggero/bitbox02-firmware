@@ -715,9 +715,9 @@ struct TxHashes {
 }
 
 /// Contribute to the MuSig2 contexts of an input in the second pass of a round: a public nonce
-/// for each context in the nonce round, or, once the host sent the public nonces of all
-/// participants, a partial signature in the signing round. A context the host skips gets no
-/// contribution.
+/// for each context in the nonce round, or, once the host sent the public nonces of the other
+/// participants, a partial signature, together with our public nonce in the single round. A context
+/// the host skips gets no contribution.
 #[allow(clippy::too_many_arguments)]
 async fn sign_musig2_input(
     hal: &mut impl crate::hal::Hal,
@@ -780,11 +780,19 @@ async fn sign_musig2_input(
                 round.skip(input_index, position)?;
                 continue;
             }
-            let nonces = musig2::order_nonces(input_index, metadata, &context, &request)?;
-            result.partial_signature = round
-                .sign(hal, input_index, position, &context, &sighash, &nonces)
-                .await?
-                .to_vec();
+            if round.mode == musig2::Mode::Sign {
+                let nonces = musig2::order_nonces(input_index, metadata, &context, &request, None)?;
+                result.partial_signature = round
+                    .sign(hal, input_index, position, &context, &sighash, &nonces)
+                    .await?
+                    .to_vec();
+            } else {
+                let (public_nonce, partial_signature) = round
+                    .nonce_and_sign(hal, input_index, metadata, &context, &sighash, &request)
+                    .await?;
+                result.public_nonce = public_nonce.to_vec();
+                result.partial_signature = partial_signature.to_vec();
+            }
         }
         next_response.next.musig2_results.push(result);
     }
