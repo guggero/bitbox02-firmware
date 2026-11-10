@@ -22,6 +22,7 @@ const PURPOSE_P2TR: u32 = 86 + HARDENED;
 const PURPOSE_MULTISIG: u32 = 48 + HARDENED;
 const MULTISIG_SCRIPT_TYPE_P2WSH: u32 = 2 + HARDENED;
 const MULTISIG_SCRIPT_TYPE_P2WSH_P2SH: u32 = 1 + HARDENED;
+const MULTISIG_SCRIPT_TYPE_P2TR: u32 = 3 + HARDENED;
 
 /// Validates a keypath to be
 /// m/expected_purpose/expected_coin/account, where account between 0' and 99'.
@@ -147,9 +148,27 @@ pub fn validate_address_simple(
     }
 }
 
+/// Validates a Taproot multisig keypath: m/48'/coin'/account'/3', the BIP-48 script type used for
+/// the participant keys of Taproot policies like `tr(musig(@0,@1)/**)`.
+fn validate_account_multisig_taproot(
+    keypath: &[u32],
+    expected_coin: u32,
+    taproot_support: bool,
+) -> Result<(), ()> {
+    match *keypath {
+        [purpose, coin, account, MULTISIG_SCRIPT_TYPE_P2TR] if taproot_support => {
+            validate_account(&[purpose, coin, account], PURPOSE_MULTISIG, expected_coin)
+        }
+        _ => Err(()),
+    }
+}
+
 /// Checks if the the xpub at this keypath can be exported without warning the user of that it is an
 /// unusual keypath.
 pub fn validate_xpub(keypath: &[u32], expected_coin: u32, taproot_support: bool) -> Result<(), ()> {
+    if validate_account_multisig_taproot(keypath, expected_coin, taproot_support).is_ok() {
+        return Ok(());
+    }
     for &script_type in ALL_MULTISCRIPT_SCRIPT_TYPES.iter() {
         if validate_account_multisig(keypath, expected_coin, script_type).is_ok() {
             return Ok(());
@@ -545,10 +564,36 @@ mod tests {
             .is_err()
         );
 
-        // Invalid multisig script type.
+        // Taproot multisig xpub, only valid with Taproot support.
         assert!(
             validate_xpub(
                 &[48 + HARDENED, bip44_coin, 0 + HARDENED, 3 + HARDENED],
+                bip44_coin,
+                taproot_support
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_xpub(
+                &[48 + HARDENED, bip44_coin, 0 + HARDENED, 3 + HARDENED],
+                bip44_coin,
+                false,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_xpub(
+                &[48 + HARDENED, bip44_coin, 100 + HARDENED, 3 + HARDENED],
+                bip44_coin,
+                taproot_support
+            )
+            .is_err()
+        );
+
+        // Invalid multisig script type.
+        assert!(
+            validate_xpub(
+                &[48 + HARDENED, bip44_coin, 0 + HARDENED, 4 + HARDENED],
                 bip44_coin,
                 taproot_support
             )
