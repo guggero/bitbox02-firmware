@@ -35,6 +35,7 @@ from .bitbox02 import (
     BitBoxSyncIdentity,
     BitBox02,
     BTCInputType,
+    BTCMuSig2Session,
     BTCOutputExternal,
     BTCOutputInternal,
     BTCOutputType,

@@ -18,6 +18,7 @@ from .bitbox02 import (
     Backup,
     BitBox02,
     BTCInputType,
+    BTCMuSig2Session,
     BTCOutputExternal,
     BTCOutputInternal,
     BTCOutputType,
