@@ -295,6 +295,7 @@ dependencies = [
  "bitcoin",
  "cc",
  "hex_lit",
+ "zeroize",
 ]
 
 [[package]]

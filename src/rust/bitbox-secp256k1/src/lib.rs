@@ -4,6 +4,8 @@
 
 extern crate alloc;
 
+pub mod musig;
+
 pub use bitcoin::secp256k1::constants::PUBLIC_KEY_SIZE;
 use bitcoin::secp256k1::ffi::CPtr;
 use bitcoin::secp256k1::{All, Secp256k1};

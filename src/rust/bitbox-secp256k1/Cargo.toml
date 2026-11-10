@@ -13,6 +13,7 @@ doctest = false
 
 [dependencies]
 bitcoin = { workspace = true }
+zeroize = { workspace = true }
 
 [dev-dependencies]
 hex_lit = { workspace = true }
