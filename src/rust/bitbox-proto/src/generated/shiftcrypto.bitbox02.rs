@@ -639,6 +639,9 @@ pub struct BtcSignInitRequest {
     /// PSBT_GLOBAL_GENERIC_SIGNED_MESSAGE (0x09) defined in BIP-322 v1.0.0.
     #[prost(bytes = "vec", optional, tag = "11")]
     pub bip322_message: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Two BIP373 signing rounds; absent preserves ordinary signing.
+    #[prost(message, optional, tag = "12")]
+    pub musig2: ::core::option::Option<BtcMuSig2Init>,
 }
 /// Nested message and enum types in `BTCSignInitRequest`.
 pub mod btc_sign_init_request {
@@ -671,7 +674,7 @@ pub mod btc_sign_init_request {
         }
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BtcSignNextResponse {
     #[prost(enumeration = "btc_sign_next_response::Type", tag = "1")]
     pub r#type: i32,
@@ -694,6 +697,15 @@ pub struct BtcSignNextResponse {
     pub generated_output_pkscript: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "8")]
     pub silent_payment_dleq_proof: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "9")]
+    pub musig2_session_id: ::prost::alloc::vec::Vec<u8>,
+    /// Contributions to the MuSig2 contexts of the inputs, see BTCMuSig2Result.
+    #[prost(message, repeated, tag = "10")]
+    pub musig2_results: ::prost::alloc::vec::Vec<BtcMuSig2Result>,
+    /// For MUSIG2_NONCES: the position of the context in BTCSignInputRequest.musig2
+    /// of the input at `index` the nonces are requested for.
+    #[prost(uint32, tag = "11")]
+    pub musig2_index: u32,
 }
 /// Nested message and enum types in `BTCSignNextResponse`.
 pub mod btc_sign_next_response {
@@ -709,6 +721,7 @@ pub mod btc_sign_next_response {
         PrevtxOutput = 5,
         HostNonce = 6,
         PaymentRequest = 7,
+        Musig2Nonces = 8,
     }
     impl Type {
         /// String value of the enum field names used in the ProtoBuf definition.
@@ -725,6 +738,7 @@ pub mod btc_sign_next_response {
                 Self::PrevtxOutput => "PREVTX_OUTPUT",
                 Self::HostNonce => "HOST_NONCE",
                 Self::PaymentRequest => "PAYMENT_REQUEST",
+                Self::Musig2Nonces => "MUSIG2_NONCES",
             }
         }
         /// Creates an enum from field names used in the ProtoBuf definition.
@@ -738,12 +752,13 @@ pub mod btc_sign_next_response {
                 "PREVTX_OUTPUT" => Some(Self::PrevtxOutput),
                 "HOST_NONCE" => Some(Self::HostNonce),
                 "PAYMENT_REQUEST" => Some(Self::PaymentRequest),
+                "MUSIG2_NONCES" => Some(Self::Musig2Nonces),
                 _ => None,
             }
         }
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BtcSignInputRequest {
     #[prost(bytes = "vec", tag = "1")]
     pub prev_out_hash: ::prost::alloc::vec::Vec<u8>,
@@ -764,6 +779,131 @@ pub struct BtcSignInputRequest {
     /// This differs from plain RFC6979 and does not provide anti-klepto protection.
     #[prost(message, optional, tag = "8")]
     pub host_nonce_commitment: ::core::option::Option<AntiKleptoHostNonceCommitment>,
+    /// Every MuSig2 context of ours the input can be spent with, e.g. the key path
+    /// aggregate and a leaf aggregate. The list must be identical in all rounds of
+    /// a session; contexts the host cannot complete are skipped in the nonce
+    /// exchange instead, see BTCMuSig2NoncesRequest.skip.
+    #[prost(message, repeated, tag = "9")]
+    pub musig2: ::prost::alloc::vec::Vec<BtcMuSig2Input>,
+}
+/// Secret nonces remain in volatile device memory between these rounds.
+/// Cancel, lock, disconnect or a new Noise session requires fresh nonces.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BtcMuSig2Init {
+    #[prost(enumeration = "btc_mu_sig2_init::Phase", tag = "1")]
+    pub phase: i32,
+    /// Empty for NONCE and NONCE_AND_SIGN. The device-generated 32-byte handle
+    /// for SIGN/ABORT. This is host coordination state, not a standardized PSBT
+    /// field.
+    #[prost(bytes = "vec", tag = "2")]
+    pub session_id: ::prost::alloc::vec::Vec<u8>,
+}
+/// Nested message and enum types in `BTCMuSig2Init`.
+pub mod btc_mu_sig2_init {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+    #[repr(i32)]
+    pub enum Phase {
+        Nonce = 0,
+        Sign = 1,
+        Abort = 2,
+        /// Single round for the last participant to contribute a nonce: the host
+        /// supplies every other participant's public nonce, the device generates
+        /// its own nonce and signs immediately. No secret nonce is retained.
+        NonceAndSign = 3,
+    }
+    impl Phase {
+        /// String value of the enum field names used in the ProtoBuf definition.
+        ///
+        /// The values are not transformed in any way and thus are considered stable
+        /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+        pub fn as_str_name(&self) -> &'static str {
+            match self {
+                Self::Nonce => "NONCE",
+                Self::Sign => "SIGN",
+                Self::Abort => "ABORT",
+                Self::NonceAndSign => "NONCE_AND_SIGN",
+            }
+        }
+        /// Creates an enum from field names used in the ProtoBuf definition.
+        pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+            match value {
+                "NONCE" => Some(Self::Nonce),
+                "SIGN" => Some(Self::Sign),
+                "ABORT" => Some(Self::Abort),
+                "NONCE_AND_SIGN" => Some(Self::NonceAndSign),
+                _ => None,
+            }
+        }
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BtcMuSig2Input {
+    /// Exact BIP388 key expression from the registered policy, e.g. musig(@0,@1)/**.
+    /// BTCSignInputRequest.keypath is an address selector: participant origin path
+    /// followed by aggregate branch/index. Only the origin derives the private key.
+    #[prost(string, tag = "1")]
+    pub key_expression: ::prost::alloc::string::String,
+    /// PSBT_IN_MUSIG2_PARTICIPANT_PUBKEYS: bare KeyAgg key and ordered keys.
+    #[prost(bytes = "vec", tag = "2")]
+    pub aggregate_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", repeated, tag = "3")]
+    pub participant_pubkeys: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
+    /// Aggregate key in the BIP373 nonce/signature key-data tuple. It may be the
+    /// bare aggregate, its derived internal key, or its tweaked output key; the
+    /// device verifies the relationship to the registered policy.
+    #[prost(bytes = "vec", tag = "4")]
+    pub context_key: ::prost::alloc::vec::Vec<u8>,
+    /// Omitted for key-path signing; exactly 32 bytes for a policy tapscript leaf.
+    #[prost(bytes = "vec", optional, tag = "5")]
+    pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BtcMuSig2Nonce {
+    /// compressed, 33 bytes
+    #[prost(bytes = "vec", tag = "1")]
+    pub participant_pubkey: ::prost::alloc::vec::Vec<u8>,
+    /// two compressed points, 66 bytes
+    #[prost(bytes = "vec", tag = "2")]
+    pub public_nonce: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct BtcMuSig2NoncesRequest {
+    #[prost(uint32, tag = "1")]
+    pub input_index: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub context_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "3")]
+    pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// Exactly one record per participant, in arbitrary map order. SIGN includes
+    /// ours; NONCE_AND_SIGN includes every participant except us. Empty if skip
+    /// is set.
+    #[prost(message, repeated, tag = "4")]
+    pub nonces: ::prost::alloc::vec::Vec<BtcMuSig2Nonce>,
+    /// Contribute nothing to this context, e.g. because a participant's nonce is
+    /// missing. A retained secret nonce of the context is destroyed.
+    #[prost(bool, tag = "5")]
+    pub skip: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BtcMuSig2Result {
+    /// Identifies this result, independently of the next requested input index.
+    #[prost(uint32, tag = "1")]
+    pub input_index: u32,
+    #[prost(bytes = "vec", tag = "2")]
+    pub participant_pubkey: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", tag = "3")]
+    pub context_key: ::prost::alloc::vec::Vec<u8>,
+    #[prost(bytes = "vec", optional, tag = "4")]
+    pub tapleaf_hash: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// NONCE sets only the public nonce, SIGN only the partial signature and
+    /// NONCE_AND_SIGN both.
+    ///
+    /// PSBT_IN_MUSIG2_PUB_NONCE, 66 bytes
+    #[prost(bytes = "vec", tag = "5")]
+    pub public_nonce: ::prost::alloc::vec::Vec<u8>,
+    /// PSBT_IN_MUSIG2_PARTIAL_SIG, 32 bytes
+    #[prost(bytes = "vec", tag = "6")]
+    pub partial_signature: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BtcSignOutputRequest {
@@ -1001,7 +1141,7 @@ pub struct BtcSignMessageResponse {
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BtcRequest {
-    #[prost(oneof = "btc_request::Request", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9")]
+    #[prost(oneof = "btc_request::Request", tags = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10")]
     pub request: ::core::option::Option<btc_request::Request>,
 }
 /// Nested message and enum types in `BTCRequest`.
@@ -1026,16 +1166,18 @@ pub mod btc_request {
         PaymentRequest(super::BtcPaymentRequestRequest),
         #[prost(message, tag = "9")]
         Xpubs(super::BtcXpubsRequest),
+        #[prost(message, tag = "10")]
+        Musig2Nonces(super::BtcMuSig2NoncesRequest),
     }
 }
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BtcResponse {
     #[prost(oneof = "btc_response::Response", tags = "1, 2, 3, 4, 5, 6")]
     pub response: ::core::option::Option<btc_response::Response>,
 }
 /// Nested message and enum types in `BTCResponse`.
 pub mod btc_response {
-    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
     pub enum Response {
         #[prost(message, tag = "1")]
         Success(super::BtcSuccess),
