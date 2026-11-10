@@ -16,6 +16,7 @@ recorded separately.
 - Add German firmware translations
 - Bitcoin: allow signing messages with taproot (P2TR) keys, as BIP-322 simple signatures
 - Bitcoin: sign BIP-322 messages and proofs of funds with any account, including multisig and policies, by signing the BIP-322 PSBT
+- Bitcoin: allow wallet policies on regtest
 
 ### v9.27.1
 - API: include the installed bootloader version in the device info response
